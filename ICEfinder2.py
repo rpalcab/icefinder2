@@ -1,91 +1,107 @@
-#!/usr/bin/env python3
-
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-#
-# ICEfinder: Detecting Integrative and Conjugative Elements in Bacteria.
-# Meng Wang on Sep-4-2023
-# School of Life Sciences & Biotechnology, Shanghai Jiao Tong University
-# Version 2.0 - Sep 4, 2023
-########################################################################
 
-import os
 import argparse
 import logging
+from pathlib import Path
+from typing import Tuple
+
 from script.checkin import get_fagb
-from script.single import _single
-from script.metaICE import _meta
 from script.config import get_param
+from script.metaICE import _meta
+from script.single import _single
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-workdir,kraken,krakenDB,defensefinder,blastp,blastn,seqkit,prodigal,prokka,macsyfinder,hmmsearch = get_param()
-logging.info(f"""
-###################
-Starting ICEfinder2
-###################
+logging.basicConfig(
+        level=logging.INFO,
+        datefmt='%m/%d/%Y %I:%M:%S',
+        handlers=[logging.StreamHandler()]
+    )
 
-config.ini data -->
-	Workdir: {workdir}
-	kraken2: {kraken}
-	kraken2 DB: {krakenDB}
-	defensefinder: {defensefinder}
-	blastp: {blastp}
-	blastn: {blastn}
-	seqkit: {seqkit}
-	prodigal: {prodigal}
-	prokka: {prokka}
-	macsyfinder: {macsyfinder}
-	hmmsearch: {hmmsearch}
-""")
+def add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
+    """Adds command-line arguments to the parser."""
+    parser.add_argument(
+        "-v", "--version", action="version", version="2.0", help="Show ICEfinder version"
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=Path,
+        required=True,
+        help="Input file in FASTA/Genbank format (Genbank only for single genome)",
+    )
+    parser.add_argument(
+        "-o",
+        "--outdir",
+        type=Path,
+        required=True,
+        help="Output directory for results",
+    )
+    parser.add_argument(
+        "-t",
+        "--type",
+        type=str,
+        required=True,
+        choices=["Single", "Metagenome"],
+        help="Analysis type: Single genome or Metagenome",
+    )
 
-tmp_dir = os.path.join(workdir,'tmp')
-fa_dir = os.path.join(tmp_dir,'fasta') 
-gb_dir = os.path.join(tmp_dir,'gbk')
 
-def add_arguments_to_parser(parser):
+def setup_directories(outdir: Path) -> Tuple[Path, Path, Path]:
+    """Creates and returns the required directory structure."""
+    tmp_dir = outdir / "tmp"
+    fa_dir = tmp_dir / "fasta"
+    gb_dir = tmp_dir / "gbk"
 
-	parser.add_argument('-v', '--version', action='version', version='2.0',
-                        help="Show ICEfinder version")
-	parser.add_argument('-i', '--input', type=str, required=True,
-                        help='FASTA/Genbank format file, Genbank format file accepted only for single genome.')
-	parser.add_argument('-t', '--type', type=str, required=True,
-                        help='Genome Type: Single/Metagenome')
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fa_dir.mkdir(exist_ok=True)
+    gb_dir.mkdir(exist_ok=True)
+
+    return tmp_dir, fa_dir, gb_dir
+
+
+def main() -> None:
+    logging.info("\n###################\nStarting ICEfinder2\n###################")
+
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="ICEfinder - Identify ICE elements in genomic data",
+        usage="python ICEfinder.py -i input_file -o output_dir -t {Single,Metagenome}",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_arguments_to_parser(parser)
+    args = parser.parse_args()
+
+    # Validate and create output directories
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    tmp_dir, fa_dir, gb_dir = setup_directories(args.outdir)
+
+    # Get parameters from configuration
+    logging.debug("Loaded configuration parameters")
+
+    # Set up analysis parameters
+    run_id = args.input.stem
+    logging.info(
+        f"\nInput data -->\n"
+        f"\tFile: {args.input}\n"
+        f"\tType: {args.type}\n"
+        f"\tRun ID: {run_id}\n"
+        f"\tOutput dir: {args.outdir}\n"
+    )
+
+    # Process input file
+    infile, filetype = get_fagb(run_id, args.input, args.type, tmp_dir, fa_dir, gb_dir)
+
+    # Execute analysis pipeline
+    if args.type == "Single":
+        logging.info("Executing Single genome mode")
+        _single(run_id, infile, filetype)
+    else:
+        logging.info("Executing Metagenome mode")
+        _meta(run_id, infile)
+
+    logging.info(f"Analysis completed for {run_id}!")
+
 
 if __name__ == "__main__":
-
-	parser = argparse.ArgumentParser(description='ICEfinder', usage='python ICEfinder.py -i fasta_file/genbank_file -t Single/Metagenome',
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-	add_arguments_to_parser(parser)
-	args = parser.parse_args()
-	intype = args.type
-	input_file = args.input
-
-	if not os.path.exists(tmp_dir):
-		os.mkdir(tmp_dir)
-	if not os.path.exists(gb_dir):
-		os.mkdir(gb_dir)
-	if not os.path.exists(fa_dir):
-		os.mkdir(fa_dir)
-
-	runID = file_name_without_extension = os.path.splitext(os.path.basename(input_file))[0]
-
-	logging.info(f"""
-Input data -->
-	File: {input_file}
-	intype: {intype}
-	runID: {runID}
-	Tmp folder: {tmp_dir}
-	Genebank folder: {gb_dir}
-	Fasta folder: {fa_dir}
-""")
-
-	infile,filetype = get_fagb(runID,input_file,intype)
-
-	if intype == 'Single':
-		logging.info("Executing Single mode")
-		_single(runID,infile,filetype)
-	else:
-		logging.info("Executing Meta mode")
-		_meta(runID,infile)
-
-	print(runID+' done!!')
+    main()

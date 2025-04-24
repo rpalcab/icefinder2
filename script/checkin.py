@@ -1,110 +1,84 @@
-#!/public/wangm/miniconda3/bin/python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os,sys,shutil
+import shutil
+import sys
+from pathlib import Path
+from typing import Tuple
 from Bio import SeqIO
-from script.config import get_param
 
-param = get_param()
-workdir = param[0]
-tmp_dir = os.path.join(workdir,'tmp') 
-in_dir = os.path.join(tmp_dir,'fasta')
-gb_dir = os.path.join(tmp_dir,'gbk')
+class SequenceProcessingError(Exception):
+    """Custom exception for sequence processing errors."""
+    pass
 
-def is_fagb(filename):
+def is_fagb(filepath: Path) -> str:
 
-	filetype = ''
-	with open(filename, "r") as handle1:
-		fasta = SeqIO.parse(handle1, "fasta")
-		if any(fasta):
-			filetype = 'fa'
-	with open(filename, "r") as handle2:
-		gbk = SeqIO.parse(handle2, "gb")
-		if any(gbk):
-			filetype = 'gb'
-	return filetype
+    for fmt, label in (('fasta', 'fa'), ('gb', 'gb')):
+        try:
+            records = list(SeqIO.parse(str(filepath), fmt))
+            if records:
+                return label
+        except Exception:
+            continue
+    return ''
 
-def remove_folders_with_runID(root_dir, runID):
-    for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
-        for dirname in dirnames:
-            if runID in dirname:
-                dir_to_remove = os.path.join(dirpath, dirname)
-#                print(f"Removing folder: {dir_to_remove}")
-                shutil.rmtree(dir_to_remove)
-        for filename in filenames:
-            if runID in filename:
-                file_to_remove = os.path.join(dirpath, filename)
-#                print(f"Removing file: {file_to_remove}")
-                os.remove(file_to_remove)
+def remove_folders_with_run_id(root_dir: Path, run_id: str) -> None:
+    for path in root_dir.rglob(f'*{run_id}*'):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
-def get_fagb(runID,input_file,intype):
+def process_fasta(input_file: Path, run_id: str, fa_dir: Path, intype: str) -> Tuple[Path, str]:
+    out = fa_dir / f'{run_id}.fa'
+    shutil.copy(str(input_file), str(out))
+    records = list(SeqIO.parse(str(input_file), 'fasta'))
+    if len(records) == 1:
+        return out, 'fa'
+    if intype.lower() == 'metagenome':
+        return out, 'multifa'
+    raise SequenceProcessingError("FASTA input must contain exactly one record unless Metagenome")
 
-#	for filename in os.listdir(gb_dir):
-#		file_path = os.path.join(gb_dir, filename)
-#		if runID in filename:
-#			os.remove(file_path)
+def process_gbk(infile: Path, run_id: str, fa_dir: Path, gb_dir: Path) -> Tuple[Path, str]:
+    """
+    Process a GenBank input: ensure single record, valid features, and convert to FASTA.
+    """
+    records = list(SeqIO.parse(str(infile), 'gb'))
+    if len(records) != 1:
+        raise SequenceProcessingError("GenBank input must contain exactly one record")
+    record = records[0]
+    # Check for missing locus_tag qualifiers in CDS features
+    missing_lt = sum(
+        1 for f in record.features if f.type == 'CDS' and 'locus_tag' not in f.qualifiers
+    )
+    if missing_lt > 10:
+        raise SequenceProcessingError(
+            "Too many CDS without locus_tag in GenBank input"
+        )
+    # Check for degenerate sequences (e.g., a sequence of identical bases)
+    if len(set(str(record.seq))) == 1:
+        raise SequenceProcessingError(
+            "Invalid GenBank sequence: appears degenerate"
+        )
+    # Assign new ID and write outputs
+    record.id = run_id
+    gb_out = gb_dir / f'{run_id}.gbk'
+    fa_out = fa_dir / f'{run_id}.fa'
+    SeqIO.write(record, str(gb_out), 'gb')
+    SeqIO.write(record, str(fa_out), 'fasta')
+    return fa_out, 'gb'
 
-#	folder_path = os.path.join(tmp_dir, runID)
-#	if os.path.exists(folder_path) and os.path.isdir(folder_path):
-#		shutil.rmtree(folder_path)
-	remove_folders_with_runID(gb_dir,runID)
-	remove_folders_with_runID(tmp_dir,runID)
+def get_fagb(run_id: str, input_file: Path, intype: str, tmp_dir: Path, fa_dir: Path, gb_dir: Path) -> None:
 
-	infile = os.path.join(in_dir,runID)
-	shutil.copy(input_file, infile)
-	try:
-		filetype = is_fagb(infile)
-	except:
-		print('ERROR: The input file is not a standard FASTA/GenBank format! Please check !')
-		sys.exit()
+	remove_folders_with_run_id(gb_dir,run_id)
+	remove_folders_with_run_id(tmp_dir,run_id)
 
+	filetype = is_fagb(input_file)
 	if not filetype:
-		print('ERROR: The input file is not a standard FASTA/GenBank format! Please check !')
-		sys.exit()
+		raise SequenceProcessingError(
+               "The input file is not a standard FASTA/GenBank format"
+        )
 
-	else:
-		if filetype == 'fa':
-			newfile = os.path.join(in_dir,runID+'.fa')
-			seq_record = SeqIO.parse(infile, 'fasta')
-			if len(list(seq_record)) == 1:
-				for seq_records in SeqIO.parse(infile, 'fasta'):
-					seq_records.id = runID
-					SeqIO.write(seq_records, newfile, 'fasta')
-			elif intype == 'Metagenome':
-				shutil.copy(infile, newfile)
-				filetype = 'multifa'
-			else:
-				print('ERROR: Input file accepted for one sequence only.')
-				sys.exit()
-		else:
-			if not os.path.exists(gb_dir):
-				os.makedirs(gb_dir)
-				os.chmod(gb_dir, 0o777)
-			gbfile = os.path.join(gb_dir,runID+'.gbk')
-			newfile = os.path.join(in_dir,runID+'.fa')
-			seq_record = SeqIO.parse(infile, 'gb')
-			if len(list(seq_record)) == 1:
-				i = 0
-				for seq_records in SeqIO.parse(infile, 'gb'):
-					for seq_feature in seq_records.features:
-						if seq_feature.type=="CDS":
-							if 'locus_tag' in seq_feature.qualifiers:
-								continue
-							else:
-								i += 1
-								if i > 10:
-									print('ERROR: Too many CDS do not have locus_tag in GenBank input file! Please check or try FASTA format input!')
-									sys.exit()
-					if len(set(list(str(seq_records.seq)))) == 1:
-						print('ERROR: The uploaded file is not a standard GenBank format! Please check or try a FASTA format input!')
-						sys.exit()
-
-					else:			
-						seq_records.id = runID
-						SeqIO.write(seq_records, gbfile, 'gb')
-						SeqIO.write(seq_records, newfile, 'fasta')
-			else:
-				print('ERROR: Input file accepted for one sequence only.')
-				sys.exit()
-
-	return newfile,filetype
+	if filetype == 'fa':
+		return process_fasta(input_file, run_id, fa_dir, intype)
+	return process_gbk(input_file, run_id, fa_dir, gb_dir)
