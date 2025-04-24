@@ -1,25 +1,30 @@
-#!/usr/bin/env python3
-
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import os,time
-import random,json
-import string,shutil
+import json
+import shutil
+import subprocess
+from collections import defaultdict
 from Bio import SeqIO
 from Bio.SeqUtils import GC
-from Bio.SeqFeature import CompoundLocation, FeatureLocation
-from functools import cmp_to_key
 import logging
+from typing import List
+from pathlib import Path
+from Bio.SeqFeature import CompoundLocation
 from script.function import getblast
-from script.config import get_param
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+		level=logging.INFO,
+		datefmt='%m/%d/%Y %I:%M:%S %p'
+	)
 
-workdir,kraken,krakenDB,defensefinder,blastp,blastn,seqkit,prodigal,prokka,macsyfinder,hmmsearch = get_param()
+workdir = './result'
 
 tmp_dir = os.path.join(workdir,'tmp') 
 in_dir = os.path.join(tmp_dir,'fasta')
 gb_dir = os.path.join(tmp_dir,'gbk')
+
 
 
 def get_time():
@@ -53,33 +58,58 @@ def calculate_gc(fasta_file, start, end, window_size, step_size):
 		j += 0.05
 
 	gcdict = {
-		        'xData':pos,
-		        'datasets':[{
-		            'name':'',
-		            'data':gc_contents,
-		            'unit':'%',
-		            'type':'line',
-		            "valueDecimals": 1
-		        }]
-	    }
+				'xData':pos,
+				'datasets':[{
+					'name':'',
+					'data':gc_contents,
+					'unit':'%',
+					'type':'line',
+					"valueDecimals": 1
+				}]
+		}
 
 	return gcdict
 
-def prokkanno(runID,infile):
-	logging.info("Running Prokka annotation")
-	cmd = [prokka,infile,"--force","--fast --quiet --cdsrnaolap --cpus 8 ","--outdir",gb_dir,"--prefix",runID]
-	os.system(' '.join(cmd))
+def prokka(run_id: str, infile: Path, cpus: int = 8):
+	logging.info("Running Prokka")
+	cmd = [
+		'prokka',
+		infile,
+		'--force',
+		'--fast',
+		'--quiet',
+		'--cdsrnaolap',
+		'--cpus', str(cpus),
+		'--outdir', gb_dir,
+		'--prefix', run_id
+	]
 
-def ICEscan(runID):
+	try:
+		subprocess.run(cmd, check=True)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Prokka annotation failed: {e}")
+
+def ICEscan(run_id = str, gb_dir = Path, ICE_dir = Path, cov_profile: float = 0.3):
 	logging.info("Running Macsyfinder on ICEscan model")
-	anno_fa = os.path.join(gb_dir, runID + '.faa')
-	ICE_res = os.path.join(tmp_dir, runID, runID + '_ICE')
-	ICE_cmd = macsyfinder + ' --db-type ordered_replicon --hmmer '+ hmmsearch + ' --models-dir ./data/macsydata/ --models ICEscan all --replicon-topology linear --coverage-profile 0.3 --sequence-db '+ anno_fa+ ' -o ' + ICE_res + ' > /dev/null'
-	os.system(ICE_cmd)
+	anno_fa = gb_dir / f'{run_id}.faa'
 
-def getgff1(runID):
+	cmd = [
+		'macsyfinder',
+		'--db-type', 'ordered_replicon',
+		'--models-dir', './data/macsydata/',
+		'--models', 'ICEscan', 'all',
+		'--replicon-topology', 'linear',
+		'--coverage-profile', str(cov_profile),
+		'--sequence-db', anno_fa,
+		'-o', ICE_dir
+	]
+	try:
+		subprocess.run(cmd, check=True)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"ICEscan annotation failed: {e}")
 
-	gffile = os.path.join(gb_dir, runID + '.gff')
+def getgff1(run_id):
+	gffile = os.path.join(gb_dir, run_id + '.gff')
 	locusdict = {}
 	with open(gffile,'r') as gffin:
 		trnadict = {}
@@ -97,68 +127,53 @@ def getgff1(runID):
 				posdict[ids] = pos
 				totalnum = getnum(ids)
 
-	return trnadict,posdict,header,totalnum,locusdict
+	return [trnadict,posdict,header,totalnum,locusdict]
 
-def getgff(runID):
+def getgff(run_id: str, gb_dir: Path) -> List:
+	gb_file = gb_dir / f'{run_id}.gbk'
+	faa_file = gb_dir / f'{run_id}.faa'
+	ffn_file = gb_dir / f'{run_id}.ffn'
 
-	gbfile = os.path.join(gb_dir, runID + '.gbk')
-	faafile = os.path.join(gb_dir, runID + '.faa')
-	ffnfile = os.path.join(gb_dir, runID + '.ffn')
-	records = SeqIO.parse(gbfile, "genbank")
-	locusdict = {}
-	trnadict = {}
-	posdict = {}
+	locus_dict = {}
+	pos_dict = {}
+	trna_dict = {}
 
-	with open(faafile, "w") as output_handle1, open(ffnfile, "w") as output_handle2:
-		for record in records:
-			i = 1			
+	prefix = "TMPID"
+	count = 0
+
+	with faa_file.open('w') as faa_out, ffn_file.open('w') as ffn_out:
+		for record in SeqIO.parse(gb_file, "genbank"):
 			for feature in record.features:
-				if feature.type == 'CDS' or feature.type == 'rRNA':
-					if 'locus_tag' in feature.qualifiers:
-						id = feature.qualifiers['locus_tag'][0]
-				
-						if isinstance(feature.location, CompoundLocation):
-							last_part = min(feature.location.parts, key=lambda part: part.start.position)
-						else:
-							last_part = feature.location
-						s = str(int(last_part.start))
-						e = str(int(last_part.end))
-						zf = gstrand1(last_part.strand)
+				quals = feature.qualifiers
+				if "locus_tag" not in quals:
+					continue
+				orig_id = quals["locus_tag"][0]
 
-						if 'product' in feature.qualifiers:
-							pro = feature.qualifiers['product'][0]
-						else:
-							pro = '-'
-						newid = zill('TMPID',i)
-						locusdict[newid] = id
-						posdict[newid] = [s,e,zf,pro]
-						if "translation" in feature.qualifiers:
-							aa_sequence = feature.qualifiers["translation"][0]
-							output_handle1.write(f">{newid} {pro}\n")
-							output_handle1.write(f"{aa_sequence}\n")				
-							cds_sequence = record.seq[feature.location.start:feature.location.end]
-							output_handle2.write(f">{newid} {pro}\n")
-							output_handle2.write(f"{cds_sequence}\n")
-						i += 1
-				if feature.type == 'tRNA' or feature.type == 'tmRNA':
-					if 'locus_tag' in feature.qualifiers:
-						id = feature.qualifiers['locus_tag'][0]
-						s = str(int(feature.location.start))
-						e = str(int(feature.location.end))
-						zf = gstrand1(feature.location.strand)
-						if feature.type != 'tmRNA':
-							pro = feature.qualifiers['product'][0]
-						else:
-							pro = 'tmRNA'
-						newid = zill('TMPID',i)
-						locusdict[newid] = id
-						posdict[newid] = [s,e,zf,pro]
-						trnadict[newid] = [s,e,zf,pro]
-						i += 1
-	
-	return trnadict,posdict,'TMPID',(i-1),locusdict
+				seq_nt = feature.location.extract(record).seq
 
-				
+				prod = (quals.get("product", ["tmRNA"])[0]
+					if feature.type != "tmRNA"
+					else "tmRNA")
+
+				new_id = zill(prefix, count + 1)
+				locus_dict[new_id] = orig_id
+				start = int(feature.location.start)
+				end = int(feature.location.end)
+				strand = gstrand1(feature.location.strand)
+				pos_dict[new_id] = [str(start), str(end), str(strand), prod]
+
+				if feature.type in ("CDS", "rRNA"):
+					if feature.type == "CDS":
+						aa_seq = seq_nt.translate(to_stop=True)
+						faa_out.write(f">{new_id} {prod}\n{aa_seq}\n")
+					ffn_out.write(f">{new_id} {prod}\n{seq_nt}\n")
+
+				if feature.type in ("tRNA", "tmRNA"):
+					trna_dict[new_id] = pos_dict[new_id]
+
+				count += 1
+	return [trna_dict, pos_dict, prefix, count-1, locus_dict]
+
 def getnum(ID):
 
 	return int(ID.split('_')[1].lstrip("0"))
@@ -201,7 +216,7 @@ def pos_tag(pos,posdict,ICE,final,totalnum,dirtag):
 			break
 	return tICE, tfinal
 
-def merge_tRNA(runID,ICEdict,DRlist,listgff):
+def merge_tRNA(run_id,ICEdict,DRlist,listgff):
 
 	[trnadict,posdict,header,totalnum,locusdict] = listgff
 
@@ -277,10 +292,10 @@ def merge_tRNA(runID,ICEdict,DRlist,listgff):
 					break
 	return myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,posdict,header,trnalist,locusdict
 
-def get_DR(runID,infile):
+def get_DR(run_id,infile):
 
-	DRindex = os.path.join(tmp_dir, runID, runID+'_DR')
-	DRout = os.path.join(tmp_dir, runID, runID+'_DRout')
+	DRindex = os.path.join(tmp_dir, run_id, run_id+'_DR')
+	DRout = os.path.join(tmp_dir, run_id, run_id+'_DRout')
 	maktree_cmd = './tool/mkvtree -db ' + infile +' -indexname '+ DRindex +' -dna -pl -lcp -suf -tis -ois -bwt -bck -sti1'
 	vmatch_cmd = './tool/vmatch -l 15 '+ DRindex + ' > '+ DRout
 	os.system(maktree_cmd)
@@ -295,18 +310,18 @@ def get_DR(runID,infile):
 				DRlist.append('|'.join(DR))
 	return DRlist
 
-def oritseq(runID, regi, infile, start, end):
+def oritseq(run_id, regi, infile, start, end):
 	logging.info("Running Blast for OriT detection")
 	oritseq = '-'
-	fafile = os.path.join(tmp_dir,runID,regi+'_fororit.fa')	
+	fafile = os.path.join(tmp_dir,run_id,regi+'_fororit.fa')	
 	with open(fafile,'w') as orif:
 		seq = getfa(infile,start,end)
 		orif.write('>fororit\n')
 		orif.write(seq)
 
 	oriT_Database = os.path.join(workdir,'data','oriT_db')
-	blastn_out = os.path.join(tmp_dir,runID,regi+'_oriTout')
-	blast_cmd = [blastn, "-db", oriT_Database, "-query", fafile, "-evalue 0.01 -word_size 11 -outfmt '6 std qlen slen' -num_alignments 1 -out", blastn_out,">/dev/null"]
+	blastn_out = os.path.join(tmp_dir,run_id,regi+'_oriTout')
+	blast_cmd = ['blastn', "-db", oriT_Database, "-query", fafile, "-evalue 0.01 -word_size 11 -outfmt '6 std qlen slen' -num_alignments 1 -out", blastn_out,">/dev/null"]
 	os.system(' '.join(blast_cmd))
 
 	with open(blastn_out,'r') as oritout:
@@ -322,79 +337,88 @@ def oritseq(runID, regi, infile, start, end):
 					break
 	return oritseq
 
-def ICE_filter(ICE_res):
+def ICE_filter(ice_res):
 	logging.info("Filtering ICEs")
-	with open(ICE_res,'r') as ICEin:
-		ICEfdict = {'ICE':[]}
-		IMEfdict = {}
-		IMEgendict = {}
-		AICEfdict = {}
-		fICE = []
-		fAICE = []
-		for line in ICEin.readlines():
-			if 'Chromosome' in line:
-				lines = line.strip().split('\t')
-				if lines[7] != '1':
-					continue
-				else:
-					IDtag = lines[3]
-					ICEtag = lines[5]
-					if 'IME' in ICEtag:
-						if ICEtag not in IMEfdict:
-							IMEfdict[ICEtag] = [IDtag]
-							IMEgendict[ICEtag] = [lines[2]]
-						else:
-							IMEfdict[ICEtag] += [IDtag]
-							IMEgendict[ICEtag] += [lines[2]]
-					elif 'AICE' in ICEtag:
-						if ICEtag not in AICEfdict:
-							AICEfdict[ICEtag] = [IDtag]
-						else:
-							AICEfdict[ICEtag] += [IDtag]
-						if ICEtag not in fAICE:
-							fAICE.append(ICEtag)
-					else:
-						ICEfdict['ICE'] += [IDtag]						
-						if ICEtag not in fICE:
-							fICE.append(ICEtag)
+	if not ice_res.is_file():
+		raise FileNotFoundError(f"ICE result file not found: {ice_res}")
 
-	Indict = {
-		'Phage_integrase':'Integrase','UPF0236':'Integrase',
-        'Recombinase':'Integrase','rve':'Integrase',
-        'TIGR02224':'Integrase','TIGR02249':'Integrase',
-        'TIGR02225':'Integrase','PB001819':'Integrase'}
+	# Initialize dictionaries and lists
+	ice_dict = {'ICE': []}
+	ime_dict = defaultdict(list)
+	ime_genes = defaultdict(list)
+	aice_dict = defaultdict(list)
+	ice_tags = []
+	aice_tags = []
 
-	IMEgenlist = []
-	for k,v in IMEgendict.items():
-		genecount = []
-		for line in v:
-			if 'Relaxase_' in line or 'T4SS_MOB' in line: 
-				genecount.append('MOB')
-			elif line in Indict:
-				genecount.append('Int')
-		if len(set(genecount)) ==2:
-			IMEgenlist.append(k)
+	# Read and filter lines
+	with ice_res.open('r') as infile:
+		for line in infile:
+			if 'Chromosome' not in line:
+				continue
+			cols = line.rstrip().split('\t')
+			# Expect at least 8 columns
+			if len(cols) < 8 or cols[7] != '1':
+				continue
 
-	fIME = []
-	for k,v in IMEfdict.items():
-		for k1,v1 in ICEfdict.items():
-			if not set(v).issubset(set(v1)):
-				if k not in fIME and k in IMEgenlist:
-					fIME.append(k)
+			id_tag = cols[3]
+			ice_tag = cols[5]
+			feature_source = cols[2]
 
-	return fICE+fIME+fAICE
+			if 'IME' in ice_tag:
+				ime_dict[ice_tag].append(id_tag)
+				ime_genes[ice_tag].append(feature_source)
 
-def get_ICE(runID,infile,listgff):
+			elif 'AICE' in ice_tag:
+				aice_dict[ice_tag].append(id_tag)
+				if ice_tag not in aice_tags:
+					aice_tags.append(ice_tag)
 
-	ICE_dir = os.path.join(tmp_dir, runID, runID + '_ICE')
-	ICE_res = os.path.join(ICE_dir,'all_systems.tsv')
+			else:
+				ice_dict['ICE'].append(id_tag)
+				if ice_tag not in ice_tags:
+					ice_tags.append(ice_tag)
 
-	if os.path.exists(ICE_dir):
-		os.system('rm -r ' + ICE_dir)
-	ICEscan(runID)
+	# Define gene indicator mapping
+	integrase_map = {
+		'Phage_integrase': 'Integrase', 'UPF0236': 'Integrase',
+		'Recombinase': 'Integrase', 'rve': 'Integrase',
+		'TIGR02224': 'Integrase', 'TIGR02249': 'Integrase',
+		'TIGR02225': 'Integrase', 'PB001819': 'Integrase'
+	}
+
+	# Identify IME tags with both MOB and Integrase
+	valid_ime_tags: List[str] = []
+	for tag, genes in ime_genes.items():
+		gene_types = set()
+		for gene in genes:
+			if 'Relaxase_' in gene or 'T4SS_MOB' in gene:
+				gene_types.add('MOB')
+			elif gene in integrase_map:
+				gene_types.add('Int')
+		if gene_types == {'MOB', 'Int'}:
+			valid_ime_tags.append(tag)
+
+	# Filter IME tags where their IDs are not a subset of ICE IDs
+	ime_tags: List[str] = []
+	ice_ids = set(ice_dict['ICE'])
+	for tag, ids in ime_dict.items():
+		if tag in valid_ime_tags and not set(ids).issubset(ice_ids):
+			ime_tags.append(tag)
+
+	# Combine results preserving order: ICE, IME, AICE
+	return ice_tags + ime_tags + aice_tags
+
+def get_ICE(run_id = str, infile = Path, listgff = List, outdir = Path, tmp_dir = Path, gb_dir = Path):
+
+	ICE_dir = tmp_dir / f'{run_id}_ICE'
+	ICE_dir.mkdir(parents=True, exist_ok=True)
+	ICE_res = ICE_dir / 'all_systems.tsv'
+
+	shutil.rmtree(ICE_dir, ignore_errors=True)
+	ICEscan(run_id, gb_dir, ICE_dir)
 	ftag = ICE_filter(ICE_res)
 
-	with open(ICE_res,'r') as ICEin:
+	with ICE_res.open('r') as ICEin:
 		ICEdict = {}
 		infodict = {}
 		for line in ICEin.readlines():
@@ -439,17 +463,17 @@ def get_ICE(runID,infile,listgff):
 	posdict = {}
 	trnalist = []
 	header = ''
-	DRlist = get_DR(runID,infile)
+	DRlist = get_DR(run_id,infile)
 
 	for key,value in ICEdict.items():
-		myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,posdict,header,trnalist,locusdict = merge_tRNA(runID,value,DRlist,listgff)
+		myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,posdict,header,trnalist,locusdict = merge_tRNA(run_id,value,DRlist,listgff)
 		dictICE[key] = [myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,trnalist,locusdict]
 
 	return dictICE,ICEdict,posdict,header,infodict					
 
-def args(runID):
+def args(run_id):
 
-	return getblast(runID)
+	return getblast(run_id)
 
 def get_args(argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict,gene,feature,product):
 
@@ -488,9 +512,9 @@ def get_feat(feat):
 	logging.info(f"Extracting ICE features: {feat}")
 	featuredict = {
 		'Phage_integrase':'Integrase','UPF0236':'Integrase',
-        'Recombinase':'Integrase','rve':'Integrase',
-        'TIGR02224':'Integrase','TIGR02249':'Integrase',
-        'TIGR02225':'Integrase','PB001819':'Integrase',
+		'Recombinase':'Integrase','rve':'Integrase',
+		'TIGR02224':'Integrase','TIGR02249':'Integrase',
+		'TIGR02225':'Integrase','PB001819':'Integrase',
 		'RepSAv2':'Rep','DUF3631':'Rep','Prim-Pol':'Rep',
 		'FtsK_SpoIIIE':'Tra'}
 
@@ -526,13 +550,13 @@ def getcolor(feature,product):
 	}
 
 	namedict = {'Hyp':'Hypothetical protein','Gene':'Other gene',
-		    'AR':'Antibiotic resistance gene',
-		    'VF':'Virulence factor','Metal':'Metal resistance',
-		    'Flank':'Flank region','Defense':'Defense system',
-		    'Transposase':'Transposase','Relaxase':'Relaxase',
-		    'T4CP':'T4CP','T4SS':'T4SS','Integrase':'Integrase',
-		    'Degradation':'Degradation','Symbiosis':'Symbiosis',
-		    'Rep':'Rep','Tra':'Tra'
+			'AR':'Antibiotic resistance gene',
+			'VF':'Virulence factor','Metal':'Metal resistance',
+			'Flank':'Flank region','Defense':'Defense system',
+			'Transposase':'Transposase','Relaxase':'Relaxase',
+			'T4CP':'T4CP','T4SS':'T4SS','Integrase':'Integrase',
+			'Degradation':'Degradation','Symbiosis':'Symbiosis',
+			'Rep':'Rep','Tra':'Tra'
 	}
 
 	if 'Integrase' in feature:
@@ -590,26 +614,23 @@ def getfa(infile,s,e):
 	sequence = seq_record.seq[int(s):int(e)]
 	return str(sequence)
 
-def get_map(runID,infile,listgff):
+def get_map(run_id = str, infile = Path, listgff = List, outdir = Path, tmp_dir = Path, gb_dir = Path, js_dir = Path, jsback = Path):
+	gcmap = jsback / 'gcmap.js'
+	viewfile = jsback / 'view.html'
+	dictICE,ICEdict,posdict,header,infodict = get_ICE(run_id, infile, listgff, outdir, tmp_dir, gb_dir)
 
-	final_dir = os.path.join(workdir,'result',runID)
-	js_dir = os.path.join(workdir,'result',runID,'js')
-	gcmap = os.path.join(workdir,'script','js','gcmap.js')
-	viewfile = os.path.join(workdir,'script','js','view.html')
-	dictICE,ICEdict,posdict,header,infodict = get_ICE(runID,infile,listgff)
-
-	argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict = args(runID)
+	argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict = args(run_id)
 
 	ICEss = {}
 	for key,value in dictICE.items():
 		genelist = []
-		regi = runID+'_'+key
+		regi = run_id+'_'+key
 		regijs = key
-		genefile = os.path.join(final_dir,regi+'_gene.json')
-		infofile = os.path.join(final_dir,regi+'_info.json')
+		genefile = os.path.join(outdir,regi+'_gene.json')
+		infofile = os.path.join(outdir,regi+'_info.json')
 		gcjson = os.path.join(js_dir,regijs+'_gc.js')
 		mapfile = os.path.join(js_dir,regijs+'.js')
-		htmlfile = os.path.join(final_dir,regi+'.html')
+		htmlfile = os.path.join(outdir,regi+'.html')
 		[myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,trnalist,locusdict] = value
 
 		start = finalstart
@@ -706,7 +727,7 @@ def get_map(runID,infile,listgff):
 		else:
 			trnaout = '-'
 
-		oritseqs = oritseq(runID, regi, infile, myDR1,myDR4)
+		oritseqs = oritseq(run_id, regi, infile, myDR1,myDR4)
 #		oritdesc = "<br>".join([oritseqs[i:i+63] for i in range(0, len(oritseqs), 63)])
 
 		if 'IME' in regi:
@@ -792,31 +813,31 @@ def get_map(runID,infile,listgff):
 
 def get_color(region):
 
-        coldict = {'T4SS-type ICE':'fill:rgba(0, 128, 164,0.9)',
-                        'IME':'fill:rgba(41,76,166,0.9)',
-                        'AICE':'fill:rgba(255, 84,0,0.9)'
-        }
-        return coldict[region]
+		coldict = {'T4SS-type ICE':'fill:rgba(0, 128, 164,0.9)',
+						'IME':'fill:rgba(41,76,166,0.9)',
+						'AICE':'fill:rgba(255, 84,0,0.9)'
+		}
+		return coldict[region]
 
 def copy_files(source_dir, destination_dir):
 
-    if os.path.isfile(source_dir):  # 如果源路径是文件
-        shutil.copy(source_dir, destination_dir)
-    elif os.path.isdir(source_dir):  # 如果源路径是文件夹
-        files = os.listdir(source_dir)
-        for file in files:
-            source_file = os.path.join(source_dir, file)
-            if os.path.isfile(source_file):
-                shutil.copy(source_file, destination_dir)
-            elif os.path.isdir(source_file):
-                destination_subdir = os.path.join(destination_dir, file)
-                copy_files(source_file, destination_subdir)
+	if os.path.isfile(source_dir):  # 如果源路径是文件
+		shutil.copy(source_dir, destination_dir)
+	elif os.path.isdir(source_dir):  # 如果源路径是文件夹
+		files = os.listdir(source_dir)
+		for file in files:
+			source_file = os.path.join(source_dir, file)
+			if os.path.isfile(source_file):
+				shutil.copy(source_file, destination_dir)
+			elif os.path.isdir(source_file):
+				destination_subdir = os.path.join(destination_dir, file)
+				copy_files(source_file, destination_subdir)
 
-def getfasta(runID,infile,key,s,e,stag,etag,locusdict):
+def getfasta(run_id,infile,key,s,e,stag,etag,locusdict):
 
-	faafile = os.path.join(tmp_dir, 'gbk', runID+'.faa')
-	outfa = os.path.join(workdir,'result',runID,key+'.fa')
-	outfaa = os.path.join(workdir,'result',runID,key+'.faa')
+	faafile = os.path.join(tmp_dir, 'gbk', run_id+'.faa')
+	outfa = os.path.join(workdir,'result',run_id,key+'.fa')
+	outfaa = os.path.join(workdir,'result',run_id,key+'.faa')
 
 	seq_record = SeqIO.read(infile, "fasta")
 	with open(outfa, "w") as output_handle1:
@@ -837,11 +858,11 @@ def getfasta(runID,infile,key,s,e,stag,etag,locusdict):
 				faa_record.id = new_id
 				SeqIO.write(faa_record, output_handle2, "fasta")
 
-def getbase(runID,filetype,homelist,final_dir):
+def getbase(run_id,filetype,homelist,final_dir):
 
-	infile = os.path.join(in_dir,runID)
-	final_dir = os.path.join(workdir,'result',runID)
-	basefile = os.path.join(final_dir, runID+'_info.json')
+	infile = os.path.join(in_dir,run_id)
+	final_dir = os.path.join(workdir,'result',run_id)
+	basefile = os.path.join(final_dir, run_id+'_info.json')
 
 	if filetype == 'gb':
 		filet = 'genbank'
@@ -854,35 +875,28 @@ def getbase(runID,filetype,homelist,final_dir):
 		lengt = len(seq_record.seq)
 		gcs = "%.2f"%GC(seq_record.seq)
 
-	basedict = {'JobID':runID,
-		    'Submission date':get_time(),
-		    'Sequence name':realID,
-		    'Length': str(lengt)+' bp',
-   		    'GC Content': str(gcs) + ' %'
-		    }
+	basedict = {'JobID':run_id,
+			'Submission date':get_time(),
+			'Sequence name':realID,
+			'Length': str(lengt)+' bp',
+   			'GC Content': str(gcs) + ' %'
+			}
 	with open(basefile,'w') as gein2:
 		json.dump(basedict, gein2, indent=4)
 
-def _single(runID,infile,filetype):
+def _single(run_id: str,infile: Path,filetype: str, outdir: Path.resolve, tmp_dir: Path, fa_dir: Path, gb_dir: Path):
 
-	final_dir = os.path.join(workdir,'result',runID)
-	if not os.path.exists(final_dir):
-		os.makedirs(final_dir)
-
-	js_dir = os.path.join(workdir,'result',runID,'js')
-	if not os.path.exists(js_dir):
-		os.makedirs(js_dir)
-	jsback = os.path.join(workdir,'script','js')
-
+	js_dir = outdir / 'js'
+	js_dir.mkdir(exist_ok=True)
+	jsback = outdir / 'script' / 'js'
 	if  filetype == 'fa':
-		prokkanno(runID,infile)
-		trnadict,posdict,header,totalnum,locusdict = getgff1(runID)
+		prokka(run_id,infile)
+		listgff = getgff1(run_id)
 	else:
-		trnadict,posdict,header,totalnum,locusdict = getgff(runID)
-	listgff = [trnadict,posdict,header,totalnum,locusdict]
-	
-	ICEss = get_map(runID,infile,listgff)
-	
+		listgff = getgff(run_id, gb_dir)
+
+	ICEss = get_map(run_id, infile, listgff, outdir, tmp_dir, gb_dir, js_dir, jsback)
+
 	i = 1 
 	ICEsumlist = []
 	homelist = []
@@ -901,12 +915,12 @@ def _single(runID,infile,filetype):
 			ICEs = {
 				'id' : str(i),
 				'region':'Region'+ str(i),
-		        'location': s+'..'+e,
-		        'length': str(lengt),
-		        'gc':gc,
-		        'type': typeIE,
-		        'detail': key
-		    }
+				'location': s+'..'+e,
+				'length': str(lengt),
+				'gc':gc,
+				'type': typeIE,
+				'detail': key
+			}
 
 			homedict = {
 			  	'start' : int(s),
@@ -917,16 +931,16 @@ def _single(runID,infile,filetype):
 			   }
 			homelist.append(homedict)
 			ICEsumlist.append(ICEs)
-			getfasta(runID,infile,key,s,e,stag,etag,locusdict)
+			getfasta(run_id,infile,key,s,e,stag,etag,locusdict)
 			i += 1
 
-	ICEsum = os.path.join(final_dir, runID+'_ICEsum.json')
+	ICEsum = os.path.join(outdir, run_id+'_ICEsum.json')
 	with open(ICEsum,'w') as ice_file:
 		json.dump(ICEsumlist, ice_file, indent=4)
 
 	copy_files(jsback, js_dir)
-	getbase(runID,filetype,homelist,final_dir)
+	getbase(run_id,filetype,homelist,outdir)
 
-	tmpfile = os.path.join(tmp_dir,runID)
+	tmpfile = os.path.join(tmp_dir,run_id)
 	shutil.rmtree(tmpfile)
 

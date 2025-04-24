@@ -7,14 +7,13 @@ from pathlib import Path
 from typing import Tuple
 
 from script.checkin import get_fagb
-from script.config import get_param
 from script.metaICE import _meta
 from script.single import _single
 
 
 logging.basicConfig(
         level=logging.INFO,
-        datefmt='%m/%d/%Y %I:%M:%S',
+        datefmt='%m/%d/%Y %I:%M:%S %p',
         handlers=[logging.StreamHandler()]
     )
 
@@ -53,7 +52,7 @@ def setup_directories(outdir: Path) -> Tuple[Path, Path, Path]:
     fa_dir = tmp_dir / "fasta"
     gb_dir = tmp_dir / "gbk"
 
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(exist_ok=True)
     fa_dir.mkdir(exist_ok=True)
     gb_dir.mkdir(exist_ok=True)
 
@@ -95,7 +94,7 @@ def main() -> None:
     # Execute analysis pipeline
     if args.type == "Single":
         logging.info("Executing Single genome mode")
-        _single(run_id, infile, filetype)
+        _single(run_id, infile, filetype, args.outdir, tmp_dir, fa_dir, gb_dir)
     else:
         logging.info("Executing Metagenome mode")
         _meta(run_id, infile)
