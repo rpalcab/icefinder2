@@ -1,49 +1,289 @@
-#!/public/wangm/miniconda3/bin/python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import os,time
 import random,json
 import string,shutil
+import logging
+from pathlib import Path
+from typing import List, Union, Optional, Tuple
+import subprocess
+import pandas as pd
+
 from Bio import SeqIO
 from ete3 import NCBITaxa
 from Bio.SeqUtils import GC
 from functools import cmp_to_key
 from script.function import getblast
 from script.config import get_param
+from script.utils import copy_files
+
+logging.basicConfig(
+        level=logging.INFO,
+        datefmt='%m/%d/%Y %I:%M:%S %p',
+        handlers=[logging.StreamHandler()]
+    )
 
 param = get_param()
 workdir = param[0]
 soft_dir = param[1]
-kraken = param[1]
-krakenDB = param[2]
 blastn = param[5]
-seqkit = param[6]
-prodigal = param[7]
-prokka = param[8]
 macsyfinder = param[9]
 hmmsearch = param[10]
 
 tmp_dir = os.path.join(workdir,'tmp') 
 in_dir = os.path.join(tmp_dir,'fasta')
-gb_dir = os.path.join(tmp_dir,'gbk')
+gb_dir = os.path.join(tmp_dir,'gbk') # AHORA ES EL OUTPUT DE PROKKA
 
-def rename(runID, infile):
-	run_dir = os.path.join(tmp_dir,runID)
+
+# Refactored
+def get_time() -> str:
+
+	return time.asctime( time.localtime(time.time()) )
+
+def taxonomy(run_id: str, input: Path, outdir: Path, db: Path) -> Tuple[Path, dict, Path]:
+	logging.info("Running Kraken2")
+
+	report = outdir / 'tmp' / f'{run_id}_kraken.report'
+	output = outdir / 'tmp' / f'{run_id}_kraken.output'
+	drawout = outdir / 'tmp' / 'kraken.html'
+
+	cmd = [
+		'kraken2',
+		'--db', db,
+		'--report', report,
+		'--output', output,
+		input
+		]
+	
+	try:
+		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Kraken2 classification failed: {e}")
+
+	spdict = {}
+	with output.open() as fh:
+		for line in fh:
+			_, seq_id, taxid_str, *rest = line.rstrip("\n").split("\t")
+			if taxid_str == "0":
+				spdict[seq_id] = "-"
+			else:
+				spdict[seq_id], _ = get_ranks(int(taxid_str), NCBITaxa())
+
+	return drawout,spdict,report
+
+def prodigal(run_id: str, input: Path, outdir: Path) -> Path:
+	logging.info("Running Prodigal")
+
+	anno_fa = outdir / 'tmp' / f'{run_id}.faa'
+	anno_gff = outdir / 'tmp' / f'{run_id}.gff'
+	cmd = [
+		'prodigal',
+		'-c',
+		'-m',
+		'-q',
+		'-p', 'meta',
+		'-f', 'gff',
+		'-i', input,
+		'-a', anno_fa,
+		'-o', anno_gff
+		]
+	try:
+		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Prodigal annotation failed: {e}")
+
+	return anno_fa
+
+def get_ranks(taxid: int, _ncbi_db) -> Tuple[str, str]:
+    """
+    Given a taxonomic ID, return a tuple (species_name, strain_name).
+    If no species or strain can be resolved, returns '-' or '' respectively.
+    """
+    # 1. Retrieve full lineage and ranks
+    lineage = _ncbi_db.get_lineage(taxid)
+    ranks = _ncbi_db.get_rank(lineage)               # {taxid: rank, ...}
+    names = _ncbi_db.get_taxid_translator(lineage)   # {taxid: name, ...}
+
+    # 2. Invert to map rank → taxid
+    rank2tid = {r: tid for tid, r in ranks.items()}
+
+    # 3. Pick the “best” taxid for species-level naming:
+    #    species → genus → phylum
+    for primary_rank in ("species", "genus", "phylum"):
+        sp_tid = rank2tid.get(primary_rank)
+        if sp_tid is not None:
+            break
+    else:
+        sp_tid = None
+
+    # 4. Optionally get the strain taxid (only valid if species was found)
+    st_tid = rank2tid.get("strain") if rank2tid.get("species") else None
+
+    # 5. Lookup names, with fallbacks
+    sp_name = names.get(sp_tid, "-") if sp_tid else "-"
+    st_name = names.get(st_tid, "")  if st_tid else ""
+
+    return sp_name, st_name
+
+def getbase(run_id: str, input: Path, outdir: Path) -> Path:
+	logging.info("Getting basic sample stats")
+
+	cmd = [
+		'seqkit',
+		'stats',
+		'-a', input
+		]
+	try:
+		result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Seqkit stats failed: {e}")
+
+	for raw in result.stdout.splitlines():
+		line = raw.strip()
+		if not line.startswith("#") and not line.lower().startswith("file"):
+			cols = line.split()
+			length = cols[4]
+			contig_count = cols[3]
+			n50 = cols[12]
+			
+
+	base_file = outdir / 'tmp' / f'{run_id}_info.json'
+	base_dict = {'JobID': run_id,
+		    	 'Submission date': get_time(),
+		    	 'Total length': f'{length} bp',
+   		    	 'Contig number': contig_count,
+		    	 'Sequence N50': f'{n50} bp'
+		    }
+	with base_file.open("w") as fh:
+		json.dump(base_dict, fh, indent=4)
+
+	return base_file
+
+def hmmscan(run_id: str, input: Path, outdir: Path, anno_fa: Path) -> Path:
+	logging.info("Running hmmscan2")
+
+	scan_file = outdir / 'tmp' / f'{run_id}_prescan.tsv'
+	icescan_hmm = Path(__file__).parents[1] / 'data' / 'ICEscan.hmm'
+	hmmscan_tool = Path(__file__).parents[1] / 'tool' / 'hmmscan2'
+	cmd = [
+		hmmscan_tool,
+		'-E', str(0.00001),
+		'--tblout', scan_file,
+		icescan_hmm,
+		anno_fa
+		]
+	try:
+		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"hmmscan search failed: {e}")
+
+	return scan_file
+
+def scanf(hmmlist: List) -> bool:
+
+	ice_count = []
+	for line in hmmlist:
+		if 'MOB' in line:
+			ice_count.append('MOB')
+		elif 't4cp' in line or 'tcpA' in line:
+			ice_count.append('t4cp')
+		elif 'FA' in line:
+			ice_count.append('T4SS')
+		elif line in [
+					 'Phage_integrase', 'UPF0236',
+					 'Recombinase', 'rve', 'TIGR02224',
+					 'TIGR02249', 'TIGR02225', 'PB001819'
+					 ]:
+			ice_count.append('Int')
+		else:
+			ice_count.append('T4SS')
+	if ice_count.count('MOB') and ice_count.count('t4cp') and ice_count.count('Int') and ice_count.count('T4SS') >= 5:
+		return True
+	else:
+		return False
+
+def prescan(run_id: str, input: Path, outdir: Path) -> List:
+	anno_fa = prodigal(run_id, input, outdir)
+	scan_file = hmmscan(run_id, input, outdir, anno_fa)
+
+	df = pd.read_table(scan_file, sep=r"\s+", comment='#', header=None, usecols=range(5), 
+					   names=['target_name', 'accession', 'query_name', 'accession_fs', 'E-value_fs'])
+	df.drop_duplicates(subset='query_name', inplace=True)
+	df['key'] = df['query_name'].str.split('_').str[:-1].str.join('_')
+
+	chosen = []
+	for k, group in df.groupby('key'):
+		if scanf(group['target_name'].tolist()):
+			chosen.append(k)
+
+	return chosen
+
+def prokka(run_id: str, input: Path) -> Path:
+	logging.info("Running Prokka")
+	outdir = input.parent / 'prokka'
+	cmd = [
+		'prokka',
+		input,
+		'--force',
+		'--fast',
+		'--quiet', 
+		'--cdsrnaolap',
+		'--cpus', str(8),
+		'--outdir', outdir,
+		'--prefix', run_id
+		]
+
+	try:
+		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Prokka search failed: {e}")
+
+	return outdir
+
+def ICEscan(contig_id, prokka_dir, ice_dir) -> Path:
+	logging.info("Running Macsyfinder on ICEscan model")
+	anno_fa = prokka_dir / f'{contig_id}.faa'
+	ice_res = ice_dir / 'all_systems.tsv'
+
+	cmd = [
+		'macsyfinder',
+		'--db-type', 'ordered_replicon',
+		'--models-dir', Path(__file__).parents[1] / 'data' / 'macsydata',
+		'--models', 'ICEscan', 'all',
+		'--replicon-topology', 'linear',
+		'--coverage-profile', '0.3',
+		'--sequence-db', anno_fa,
+		'-o', ice_res
+	]
+
+	try:
+		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Macsyfinder execution failed: {e}")
+
+	return ice_res
+
+
+
+# Unsure
+def rename(run_id, input):
+	run_dir = os.path.join(tmp_dir,run_id)
 	if not os.path.exists(run_dir):
 		os.makedirs(run_dir)
 	if not os.path.exists(gb_dir):
 		os.mkdir(gb_dir)
 
-	filename = os.path.basename(infile)
+	filename = os.path.basename(input)
 	resultf = filename.rsplit('.', 1)[0]
-	infile1 = os.path.join(os.path.dirname(infile), resultf)
+	input1 = os.path.join(os.path.dirname(input), resultf)
 
 	i = 1
 	id_dict = {}
-	newIDfa = os.path.join(run_dir,runID+'_newID.fa')
+	newIDfa = os.path.join(run_dir,run_id+'_newID.fa')
 	newfa = open(newIDfa,'w')
 
-	for seq_record in SeqIO.parse(infile, "fasta"):
+	for seq_record in SeqIO.parse(input, "fasta"):
 		if len(seq_record.id) > 15:
 			realID = seq_record.id[:15]+'...'
 		else:
@@ -56,91 +296,6 @@ def rename(runID, infile):
 		i += 1
 	return id_dict
 
-def get_time():
-
-	return time.asctime( time.localtime(time.time()) )
-
-def Taxonomy(runID):
-
-	newIDfa = os.path.join(tmp_dir,runID,runID+'_newID.fa')
-	report = os.path.join(tmp_dir,runID,runID+'_kraken.report')
-	output = os.path.join(tmp_dir,runID,runID+'_kraken.output')
-	drawout = os.path.join(tmp_dir,runID,'kraken.html')
-
-	annocmd = "{} {} {} {} {} {} {} {} {}".format(kraken,"--db",krakenDB,"--report",\
-		report,"--output",output,newIDfa,'>/dev/null')
-	os.system(annocmd)
-#	drawcmd = ' '.join(['/opt/R/3.6.3/bin/Rscript', './script/sankey.R', report, drawout, '>/dev/null'])
-#	os.system(drawcmd)
-
-	spdict = {}
-	with open(output,'r') as taxainfo:
-		for line in taxainfo.readlines():
-			lines = line.strip().split('\t')
-			ID,taxid = lines[1],lines[2]
-			if taxid == '0':
-				spdict[ID] = '-'
-			else:
-				spname,strainame = get_ranks(taxid)
-				spdict[ID] = spname
-
-	return drawout,spdict,report
-
-def get_ranks(taxid):
-	ncbi = NCBITaxa()
-	lineage = ncbi.get_lineage(taxid)   
-	names = ncbi.get_taxid_translator(lineage)
-	lineage2ranks = ncbi.get_rank(names)
-	ranks2lineage = dict((rank,taxid) for (taxid, rank) in lineage2ranks.items())
-
-	strainid = ''
-	if 'species' in ranks2lineage:
-		spid = ranks2lineage['species']
-		if 'strain' in ranks2lineage:
-			strainid = ranks2lineage['strain']
-		else:
-			strainid = ''
-	elif 'genus' in ranks2lineage:
-		spid = ranks2lineage['genus']
-		strainid = ''
-	elif 'phylum' in ranks2lineage:
-		spid = ranks2lineage['phylum']
-		strainid = ''
-
-	try:
-		spname = list(ncbi.get_taxid_translator([spid]).values())[0]
-	except:
-		spname = '-'
-
-	strainame = ''
-	if strainid:
-		strainame = list(ncbi.get_taxid_translator([strainid]).values())[0]
-
-	return spname,strainame
-
-def getbase(runID):
-
-	newIDfa = os.path.join(tmp_dir, runID, runID+'_newID.fa')
-	statcmd = ' '.join([seqkit,"stats","-a",newIDfa])
-	stats = os.popen(statcmd, "r")
-	for line in stats.readlines():
-		lines = line.strip().split()
-		if lines[0] != 'file':
-			lengt = lines[4]
-			count = lines[3]
-			n50 = lines[12]
-
-	basefile = os.path.join(tmp_dir,runID, runID+'_info.json')
-	basedict = {'JobID':runID,
-		    'Submission date':get_time(),
-		    'Total length': lengt+' bp',
-   		    'Contig number': count,
-		    'Sequence N50': n50+' bp'
-		    }
-	with open(basefile,'w') as gein2:
-		json.dump(basedict, gein2, indent=4)
-
-	return basefile
 
 def gc(fasta_file,start,end):
 
@@ -181,76 +336,10 @@ def calculate_gc(fasta_file, start, end, window_size, step_size):
 
 	return gcdict
 
-def preanno(runID):
 
-	newIDfa = os.path.join(tmp_dir, runID, runID+'_newID.fa')
-	anno_fa = os.path.join(tmp_dir, runID, runID + '.faa')
-	anno_gff = os.path.join(tmp_dir, runID, runID + '.gff')
-	anno_cmd = prodigal +' -c -m -q -p meta -f gff -i ' + newIDfa + ' -a ' + anno_fa + ' -o ' + anno_gff
-	os.system(anno_cmd)
+def getgff(run_id):
 
-def scanf(hmmlist):
-
-	ICEcount = []
-	for line in hmmlist:
-		if 'MOB' in line:
-			ICEcount.append('MOB')
-		elif 't4cp' in line or 'tcpA' in line:
-			ICEcount.append('t4cp')
-		elif 'FA' in line:
-			ICEcount.append('T4SS')
-		elif line in ['Phage_integrase','UPF0236','Recombinase','rve','TIGR02224','TIGR02249','TIGR02225','PB001819']:
-			ICEcount.append('Int')
-		else:
-			ICEcount.append('T4SS')
-	if ICEcount.count('MOB') and ICEcount.count('t4cp') and ICEcount.count('Int') and ICEcount.count('T4SS') >= 5:
-		return True
-	else:
-		return False
-
-def prescan(runID):
-	preanno(runID)
-	anno_fa = os.path.join(tmp_dir, runID, runID + '.faa')
-	scanfile = os.path.join(tmp_dir, runID, runID + '_prescan')
-	scancmd = [ './tool/hmmscan2', '--tblout', scanfile, './data/ICEscan.hmm', anno_fa, '> /dev/null']
-	os.system(' '.join(scancmd))
-
-	icedict = {}
-	chosen = []
-	with open(scanfile, 'r') as outfile:
-		for line in outfile.readlines():
-			if not line.startswith('#'):
-				lines = line.strip().split()
-				if lines[2] in icedict:
-					continue
-				id_parts = lines[2].split('_')
-				key = '_'.join(id_parts[0:2])
-				if float(lines[4]) < 0.00001:
-					if key in icedict:
-						icedict[key].append(lines[0])
-					else:
-						icedict[key] = [lines[0]]
-	for k,v in icedict.items():
-		if scanf(v):
-			chosen.append(k)
-
-	return chosen
-
-def prokkanno(runID,infile):
-
-	cmd = [prokka,infile,"--force","--fast --quiet --cdsrnaolap --cpus 8 ","--outdir",gb_dir,"--prefix",runID]
-	os.system(' '.join(cmd))
-
-def ICEscan(runID):
-
-	anno_fa = os.path.join(gb_dir, runID + '.faa')
-	ICE_res = os.path.join(tmp_dir, runID, runID + '_ICE')
-	ICE_cmd = macsyfinder + ' --db-type ordered_replicon --hmmer '+ hmmsearch + ' --models-dir ./data/macsydata/ --models ICEscan all --replicon-topology linear --coverage-profile 0.3 --sequence-db '+ anno_fa+ ' -o ' + ICE_res + ' > /dev/null'
-	os.system(ICE_cmd)
-
-def getgff(runID):
-
-	gffile = os.path.join(gb_dir, runID + '.gff')
+	gffile = os.path.join(gb_dir, run_id + '.gff')
 	with open(gffile,'r') as gffin:
 		trnadict = {}
 		posdict = {}
@@ -306,9 +395,9 @@ def pos_tag(pos,posdict,ICE,final,totalnum,dirtag):
 			break
 	return tICE, tfinal
 
-def merge_tRNA(runID,ICEdict,DRlist):
+def merge_tRNA(run_id,ICEdict,DRlist):
 
-	trnadict,posdict,header,totalnum = getgff(runID)
+	trnadict,posdict,header,totalnum = getgff(run_id)
 	fICE = getnum(next(iter(ICEdict)))
 	eICE = getnum(list(ICEdict.keys())[-1])
 
@@ -382,11 +471,11 @@ def merge_tRNA(runID,ICEdict,DRlist):
 
 	return myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,posdict,header,trnalist
 
-def get_DR(runID,infile):
+def get_DR(run_id,input):
 
-	DRindex = os.path.join(tmp_dir, runID, runID+'_DR')
-	DRout = os.path.join(tmp_dir, runID, runID+'_DRout')
-	maktree_cmd = './tool/mkvtree -db ' + infile +' -indexname '+ DRindex +' -dna -pl -lcp -suf -tis -ois -bwt -bck -sti1'
+	DRindex = os.path.join(tmp_dir, run_id, run_id+'_DR')
+	DRout = os.path.join(tmp_dir, run_id, run_id+'_DRout')
+	maktree_cmd = './tool/mkvtree -db ' + input +' -indexname '+ DRindex +' -dna -pl -lcp -suf -tis -ois -bwt -bck -sti1'
 	vmatch_cmd = './tool/vmatch -l 15 '+ DRindex + ' > '+ DRout
 	os.system(maktree_cmd)
 	os.system(vmatch_cmd)
@@ -400,20 +489,14 @@ def get_DR(runID,infile):
 				DRlist.append('|'.join(DR))
 	return DRlist
 
-def get_ICE(runID,infile):
+def get_ICE(contig_id, input, ice_dir, prokka_dir):
 
-	ICE_dir = os.path.join(tmp_dir, runID, runID + '_ICE')
-	ICE_res = os.path.join(ICE_dir,'all_systems.tsv')
+	ice_res = ICEscan(contig_id, prokka_dir, ice_dir)
 
-	if os.path.exists(ICE_dir):
-		os.system('rm -r ' + ICE_dir)
-	ICEscan(runID)
-
-	with open(ICE_res,'r') as ICEin:
+	with open(ice_res,'r') as ICEin:
 		ICEdict = {}
 		infodict = {}
 		for line in ICEin.readlines():
-
 			if 'Chromosome' in line:
 				lines = line.strip().split('\t')
 				if 'UserReplicon_IME' not in lines[5]:
@@ -441,16 +524,16 @@ def get_ICE(runID,infile):
 	posdict = {}
 	trnalist = []
 	header = ''
-	DRlist = get_DR(runID,infile)
+	DRlist = get_DR(contig_id,input)
 	for key,value in ICEdict.items():
-		myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,posdict,header,trnalist = merge_tRNA(runID,value,DRlist)
+		myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,posdict,header,trnalist = merge_tRNA(contig_id,value,DRlist)
 		dictICE[key] = [myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend]
 
 	return dictICE,ICEdict,posdict,header,trnalist,infodict
 
-def args(runID):
+def args(run_id):
 
-	return getblast(runID)
+	return getblast(run_id)
 
 def zill(header,num):
 
@@ -489,17 +572,17 @@ def get_args(argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict,gene,feature
 
 	return feature,product
 
-def oritseq(runID, regi, infile, start, end):
+def oritseq(run_id, regi, input, start, end):
 
 	oritseq = '-'
-	fafile = os.path.join(tmp_dir,runID,regi+'_fororit.fa')	
+	fafile = os.path.join(tmp_dir,run_id,regi+'_fororit.fa')	
 	with open(fafile,'w') as orif:
-		seq = getfa(infile,start,end)
+		seq = getfa(input,start,end)
 		orif.write('>fororit\n')
 		orif.write(seq)
 
 	oriT_Database = os.path.join(workdir,'data','oriT_db')
-	blastn_out = os.path.join(tmp_dir,runID,regi+'_oriTout')
+	blastn_out = os.path.join(tmp_dir,run_id,regi+'_oriTout')
 	blast_cmd = [blastn, "-db", oriT_Database, "-query", fafile, "-evalue 0.01 -word_size 11 -outfmt '6 std qlen slen' -num_alignments 1 -out", blastn_out,">/dev/null"]
 	os.system(' '.join(blast_cmd))
 
@@ -597,35 +680,38 @@ def gstrand(instra):
 	strands = {'+' : 1, '-' : -1}
 	return strands[instra]
 
-def getfa(infile,s,e):
+def getfa(input,s,e):
 
-	seq_record = SeqIO.read(infile, "fasta")
+	seq_record = SeqIO.read(input, "fasta")
 	sequence = seq_record.seq[int(s):int(e)]
 	return str(sequence)
 
-def get_map(sprunID,spdict,id_dict):
+def get_map(contig_id: str, id_dict, fasta_file: Path, outdir: Path, prokka_dir: Path):
+	print(outdir, contig_id)
+	js_dir = outdir / 'js'
+	js_dir.mkdir(exist_ok=True)
+	gc_map = outdir / 'script' / 'js' / 'gcmap.js'
+	view_file = outdir / 'script' / 'js' / 'view.html'
+	ice_dir = outdir / f'{contig_id}_ICE'
+	# Aquí da fallo, ¿no está borrando?
+	if ice_dir.exists() and ice_dir.is_dir():
+		print(f"removing {ice_dir}")
+		shutil.rmtree(ice_dir)
+	ice_dir.mkdir()
 
-	final_dir = os.path.join(workdir,'tmp',sprunID,'result')
-	js_dir = os.path.join(final_dir,'js')
-	if not os.path.exists(js_dir): 
-		os.makedirs(js_dir)
-	gcmap = os.path.join(workdir,'script','js','gcmap.js')
-	viewfile = os.path.join(workdir,'script','js','view.html')
-
-	fasta_file = os.path.join(tmp_dir, sprunID, sprunID+'.fa')
-	dictICE,ICEdict,posdict,header,trnalist,infodict = get_ICE(sprunID,fasta_file)
-	argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict = args(sprunID)
+	dictICE,ICEdict,posdict,header,trnalist,infodict = get_ICE(contig_id, fasta_file, ice_dir, prokka_dir)
+	argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict = args(contig_id)
 
 	ICEss = {}
 	for key,value in dictICE.items():
 		genelist = []
-		regi = sprunID+'_'+key
-		regijs = 'contig_'+sprunID.split("_contig_", 1)[-1] +'_'+key
-		genefile = os.path.join(final_dir,regi+'_gene.json')
-		infofile = os.path.join(final_dir,regi+'_info.json')
+		regi = contig_id+'_'+key
+		regijs = 'contig_'+contig_id.split("_contig_", 1)[-1] +'_'+key
+		genefile = os.path.join(outdir,regi+'_gene.json')
+		infofile = os.path.join(outdir,regi+'_info.json')
 		gcjson = os.path.join(js_dir,regijs+'_gc.js')
 		mapfile = os.path.join(js_dir,regijs+'.js')
-		htmlfile = os.path.join(final_dir,regi+'.html')
+		htmlfile = os.path.join(outdir,regi+'.html')
 		[myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend] = value
 
 		start = finalstart
@@ -701,7 +787,7 @@ def get_map(sprunID,spdict,id_dict):
 		with open(genefile,'w') as gene_file:
 			json.dump(genelist, gene_file, indent=4)
 
-		contigID = sprunID.split('_', 1)[1]
+		contigID = contig_id.split('_', 1)[1]
 
 		sgene = zill(header,fICE)
 		egene = zill(header,eICE)
@@ -712,7 +798,8 @@ def get_map(sprunID,spdict,id_dict):
 
 		ICEss[regi] = '|'.join([myDR1,myDR4,str(fICE),str(eICE)])
 
-		host = spdict[contigID]
+		# host = spdict[contigID]
+		host = "-"
 		gcc = gc(fasta_file,int(myDR1),int(myDR4))
 		source = id_dict[contigID]
 
@@ -723,7 +810,7 @@ def get_map(sprunID,spdict,id_dict):
 		else:
 			DRw = '-'
 
-		oritseqs = oritseq(sprunID, regi, fasta_file, myDR1,myDR4)
+		oritseqs = oritseq(contig_id, regi, fasta_file, myDR1,myDR4)
 #		oritdesc = "<br>".join([oritseqs[i:i+63] for i in range(0, len(oritseqs), 63)])
 
 		ICEinfo = {
@@ -773,7 +860,7 @@ def get_map(sprunID,spdict,id_dict):
 		e = genelist[-1]['pos'].split(' ')[0].split('..')[1]
 
 		gcdict = calculate_gc(fasta_file, int(s), int(e), 500, 50)
-		with open(gcmap, 'r') as original_file:
+		with open(gc_map, 'r') as original_file:
 			original_content = original_file.read()
 		with open(gcjson,'w') as gein2:
 			gein2t = 'var jsonData = ' + str(gcdict)+';'
@@ -791,27 +878,13 @@ def get_map(sprunID,spdict,id_dict):
 		with open(mapfile,'w') as map_file:
 			map_file.write(head + maps)
 
-		with open(viewfile, 'r') as file:
+		with open(view_file, 'r') as file:
 			file_content = file.read()
 		new_content = file_content.replace('XXXX', regijs)
 		with open(htmlfile, 'w') as file:
 			file.write(new_content)
 
 	return ICEss
-
-def copy_files(source_dir, destination_dir):
-    if os.path.isfile(source_dir):
-        shutil.copy(source_dir, destination_dir)
-    elif os.path.isdir(source_dir):
-        if not os.path.exists(destination_dir):
-            os.makedirs(destination_dir)
-        for item in os.listdir(source_dir):
-            source_item = os.path.join(source_dir, item)
-            destination_item = os.path.join(destination_dir, item)
-            if os.path.isdir(source_item):
-                copy_files(source_item, destination_item)
-            else:
-                shutil.copy2(source_item, destination_item)
 
 def delete_folders_starting_with_keyword(dir, keyword):
 	for dirpath, dirnames, filenames in os.walk(dir, topdown=False):
@@ -820,10 +893,10 @@ def delete_folders_starting_with_keyword(dir, keyword):
 				folder_to_remove = os.path.join(dirpath, dirname)
 				shutil.rmtree(folder_to_remove)
 
-def getfasta(runID,resultdir,id_dict,key,s,e,stag,etag):
+def getfasta(run_id,resultdir,id_dict,key,s,e,stag,etag):
 
-	fafile = os.path.join(tmp_dir, runID, runID+'.fa')	
-	faafile = os.path.join(tmp_dir, 'gbk', runID+'.faa')
+	fafile = os.path.join(tmp_dir, run_id, run_id+'.fa')	
+	faafile = os.path.join(tmp_dir, 'gbk', run_id+'.faa')
 
 	outfa = os.path.join(resultdir,key+'.fa')
 	outfaa = os.path.join(resultdir,key+'.faa')
@@ -844,44 +917,49 @@ def getfasta(runID,resultdir,id_dict,key,s,e,stag,etag):
 			if int(stag) <= seq_id <= int(etag):
 				SeqIO.write(faa_record, output_handle2, "fasta")
 
-def _meta(runID,infile):
+def _meta(run_id: str, input: Path, outdir: Path, kraken_db: Union[Path, None], gff: Union[Path, None]) -> None:
 
-	resultdir = os.path.join(workdir, 'result', runID)
-	if not os.path.exists(resultdir):
-		os.system('mkdir '+resultdir)
-	jsback = os.path.join(workdir,'script','js')
+	jsback = outdir / 'script' / 'js'
 
-	id_dict = rename(runID,infile)
-	chosenfa = prescan(runID)
-	drawout,spdict,report = Taxonomy(runID)
-#	spdict = {}
-	basefile = getbase(runID)
-#	copy_files(drawout, resultdir)
-	copy_files(basefile, resultdir)
-	copy_files(report, resultdir)
+	# En cuarentena, quizá recomendable borrar?
+	id_dict = rename(run_id,input)
 
-	ICEsum = os.path.join(tmp_dir,runID, runID+'_ICEsum.json')
-	newIDfa = os.path.join(tmp_dir, runID, runID+'_newID.fa')
+	# ICE markers annotations
+	chosen_contigs = prescan(run_id, input, outdir)
+
+	# Taxonomy assignation (optional)
+	drawout = None
+	spdict = {}
+	report = None
+	if kraken_db:
+		drawout,spdict,report = taxonomy(run_id, input, outdir, kraken_db)
+		copy_files(report, outdir)
+		copy_files(drawout, outdir)
+
+	# Get basic information from input
+	basefile = getbase(run_id, input, outdir)
+	copy_files(basefile, outdir)
+
+	#############################################################
+	##################### Por aquí me quedé #####################
+	#############################################################
+	ICEsum = outdir / tmp_dir / f'{run_id}_ICEsum.json'
 	i = 1 
 	ICEsumlist = []
-	for seq_record in SeqIO.parse(newIDfa, "fasta"):
-		if seq_record.id in chosenfa:
-			sprunID = runID + '_' + seq_record.id
-			seqfa = str(seq_record.seq)
-			newfolder = os.path.join(tmp_dir, sprunID)			
-			if not os.path.exists(newfolder):
-				os.makedirs(newfolder)
-			spfa = os.path.join(newfolder, sprunID+'.fa')
-			with open(spfa,'w') as outfa:
-				outfa.write(">%s\n%s\n" % (sprunID,seqfa))
+	for seq_record in SeqIO.parse(input, "fasta"):
+		if seq_record.id in chosen_contigs:
 
-			final_dir = os.path.join(tmp_dir,sprunID,'result')
-			if not os.path.exists(final_dir):
-				os.makedirs(final_dir)
+			# Extract contig of interest in fasta format
+			contig_folder = outdir / tmp_dir / f'{seq_record.id}'
+			contig_folder.mkdir(exist_ok=True)
+			contig_fasta = contig_folder / f'{seq_record.id}.fasta'
+			with contig_fasta.open("w") as oh:
+				SeqIO.write(seq_record, oh, "fasta")
 
-			prokkanno(sprunID,spfa)
-			ICEss = get_map(sprunID,spdict,id_dict)
-			copy_files(final_dir, resultdir)
+			# Annotate contig
+			prokka_dir = prokka(seq_record.id, contig_fasta)
+			ICEss = get_map(seq_record.id, id_dict, contig_fasta, contig_folder, prokka_dir)
+			copy_files(contig_folder, outdir)
 
 			if ICEss:
 				for key,value in ICEss.items():
@@ -890,20 +968,20 @@ def _meta(runID,infile):
 					ICEs = {
 						'id' : str(i),
 				        'seqid': id_dict[seq_record.id],
-				        'species':spdict[seq_record.id],
-#						'species':'',
+				        # 'species':spdict[seq_record.id],
+						'species':'',
 				        'location': s+'..'+e,
 				        'length': lengt,
 				        'detail': key
 				    }
 					ICEsumlist.append(ICEs)
-					getfasta(sprunID,resultdir,id_dict,key,s,e,stag,etag)
+					getfasta(seq_record.id,outdir,id_dict,key,s,e,stag,etag)
 					i += 1 
 
 	with open(ICEsum,'w') as ice_file:
 		json.dump(ICEsumlist, ice_file, indent=4)
 
-	copy_files(ICEsum, resultdir)
-	jsdir = os.path.join(resultdir,'js')
+	copy_files(ICEsum, outdir)
+	jsdir = os.path.join(outdir,'js')
 	copy_files(jsback, jsdir)
-	delete_folders_starting_with_keyword(tmp_dir, runID)
+	delete_folders_starting_with_keyword(tmp_dir, run_id)

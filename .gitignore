@@ -1,3 +1,6 @@
 data/
 tmp/
 result/
+script/__pycache__/
+example/
+script/__pycache__/
