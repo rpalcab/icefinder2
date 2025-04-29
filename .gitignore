@@ -1,6 +1,5 @@
 data/
 tmp/
 result/
-script/__pycache__/
+script/\_\_pycache\_\_/
 example/
-script/__pycache__/

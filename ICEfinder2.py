@@ -91,6 +91,7 @@ def main() -> None:
     if args.kraken_db:          # Kraken DB exists (if provided)
         if not args.kraken_db.exists() or not args.kraken_db.is_dir():
             raise FileNotFoundError(f"Kraken2 database directory '{args.kraken_db}' does not exist or is not a directory.")
+    
     check_dbs()
 
     check_tools()

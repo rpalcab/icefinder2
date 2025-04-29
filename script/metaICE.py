@@ -2,27 +2,24 @@
 # -*- coding: utf-8 -*-
 
 import os,time
-import random,json
-import string,shutil
+import json
+import shutil
 import logging
 from pathlib import Path
-from typing import List, Union, Optional, Tuple
-import subprocess
+from typing import List, Union, Tuple, Dict
 import pandas as pd
 
 from Bio import SeqIO
-from ete3 import NCBITaxa
 from Bio.SeqUtils import GC
-from functools import cmp_to_key
-from script.function import getblast
 from script.config import get_param
-from script.utils import copy_files
+from script.utils import copy_files, zill, get_gff, get_num, find_max_distance
+from script.commands import kraken2, prodigal, seqkit, hmmscan, prokka, ICEscan, get_dr, blastn_all, blastp_all, defense_finder
 
 logging.basicConfig(
-        level=logging.INFO,
-        datefmt='%m/%d/%Y %I:%M:%S %p',
-        handlers=[logging.StreamHandler()]
-    )
+		level=logging.INFO,
+		datefmt='%m/%d/%Y %I:%M:%S %p',
+		handlers=[logging.StreamHandler()]
+	)
 
 param = get_param()
 workdir = param[0]
@@ -37,149 +34,6 @@ gb_dir = os.path.join(tmp_dir,'gbk') # AHORA ES EL OUTPUT DE PROKKA
 
 
 # Refactored
-def get_time() -> str:
-
-	return time.asctime( time.localtime(time.time()) )
-
-def taxonomy(run_id: str, input: Path, outdir: Path, db: Path) -> Tuple[Path, dict, Path]:
-	logging.info("Running Kraken2")
-
-	report = outdir / 'tmp' / f'{run_id}_kraken.report'
-	output = outdir / 'tmp' / f'{run_id}_kraken.output'
-	drawout = outdir / 'tmp' / 'kraken.html'
-
-	cmd = [
-		'kraken2',
-		'--db', db,
-		'--report', report,
-		'--output', output,
-		input
-		]
-	
-	try:
-		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
-	except subprocess.CalledProcessError as e:
-		logging.error(f"Kraken2 classification failed: {e}")
-
-	spdict = {}
-	with output.open() as fh:
-		for line in fh:
-			_, seq_id, taxid_str, *rest = line.rstrip("\n").split("\t")
-			if taxid_str == "0":
-				spdict[seq_id] = "-"
-			else:
-				spdict[seq_id], _ = get_ranks(int(taxid_str), NCBITaxa())
-
-	return drawout,spdict,report
-
-def prodigal(run_id: str, input: Path, outdir: Path) -> Path:
-	logging.info("Running Prodigal")
-
-	anno_fa = outdir / 'tmp' / f'{run_id}.faa'
-	anno_gff = outdir / 'tmp' / f'{run_id}.gff'
-	cmd = [
-		'prodigal',
-		'-c',
-		'-m',
-		'-q',
-		'-p', 'meta',
-		'-f', 'gff',
-		'-i', input,
-		'-a', anno_fa,
-		'-o', anno_gff
-		]
-	try:
-		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
-	except subprocess.CalledProcessError as e:
-		logging.error(f"Prodigal annotation failed: {e}")
-
-	return anno_fa
-
-def get_ranks(taxid: int, _ncbi_db) -> Tuple[str, str]:
-    """
-    Given a taxonomic ID, return a tuple (species_name, strain_name).
-    If no species or strain can be resolved, returns '-' or '' respectively.
-    """
-    # 1. Retrieve full lineage and ranks
-    lineage = _ncbi_db.get_lineage(taxid)
-    ranks = _ncbi_db.get_rank(lineage)               # {taxid: rank, ...}
-    names = _ncbi_db.get_taxid_translator(lineage)   # {taxid: name, ...}
-
-    # 2. Invert to map rank → taxid
-    rank2tid = {r: tid for tid, r in ranks.items()}
-
-    # 3. Pick the “best” taxid for species-level naming:
-    #    species → genus → phylum
-    for primary_rank in ("species", "genus", "phylum"):
-        sp_tid = rank2tid.get(primary_rank)
-        if sp_tid is not None:
-            break
-    else:
-        sp_tid = None
-
-    # 4. Optionally get the strain taxid (only valid if species was found)
-    st_tid = rank2tid.get("strain") if rank2tid.get("species") else None
-
-    # 5. Lookup names, with fallbacks
-    sp_name = names.get(sp_tid, "-") if sp_tid else "-"
-    st_name = names.get(st_tid, "")  if st_tid else ""
-
-    return sp_name, st_name
-
-def getbase(run_id: str, input: Path, outdir: Path) -> Path:
-	logging.info("Getting basic sample stats")
-
-	cmd = [
-		'seqkit',
-		'stats',
-		'-a', input
-		]
-	try:
-		result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-	except subprocess.CalledProcessError as e:
-		logging.error(f"Seqkit stats failed: {e}")
-
-	for raw in result.stdout.splitlines():
-		line = raw.strip()
-		if not line.startswith("#") and not line.lower().startswith("file"):
-			cols = line.split()
-			length = cols[4]
-			contig_count = cols[3]
-			n50 = cols[12]
-			
-
-	base_file = outdir / 'tmp' / f'{run_id}_info.json'
-	base_dict = {'JobID': run_id,
-		    	 'Submission date': get_time(),
-		    	 'Total length': f'{length} bp',
-   		    	 'Contig number': contig_count,
-		    	 'Sequence N50': f'{n50} bp'
-		    }
-	with base_file.open("w") as fh:
-		json.dump(base_dict, fh, indent=4)
-
-	return base_file
-
-def hmmscan(run_id: str, input: Path, outdir: Path, anno_fa: Path) -> Path:
-	logging.info("Running hmmscan2")
-
-	scan_file = outdir / 'tmp' / f'{run_id}_prescan.tsv'
-	icescan_hmm = Path(__file__).parents[1] / 'data' / 'ICEscan.hmm'
-	hmmscan_tool = Path(__file__).parents[1] / 'tool' / 'hmmscan2'
-	cmd = [
-		hmmscan_tool,
-		'-E', str(0.00001),
-		'--tblout', scan_file,
-		icescan_hmm,
-		anno_fa
-		]
-	try:
-		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
-	except subprocess.CalledProcessError as e:
-		logging.error(f"hmmscan search failed: {e}")
-
-	return scan_file
-
 def scanf(hmmlist: List) -> bool:
 
 	ice_count = []
@@ -218,51 +72,6 @@ def prescan(run_id: str, input: Path, outdir: Path) -> List:
 			chosen.append(k)
 
 	return chosen
-
-def prokka(run_id: str, input: Path) -> Path:
-	logging.info("Running Prokka")
-	outdir = input.parent / 'prokka'
-	cmd = [
-		'prokka',
-		input,
-		'--force',
-		'--fast',
-		'--quiet', 
-		'--cdsrnaolap',
-		'--cpus', str(8),
-		'--outdir', outdir,
-		'--prefix', run_id
-		]
-
-	try:
-		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
-	except subprocess.CalledProcessError as e:
-		logging.error(f"Prokka search failed: {e}")
-
-	return outdir
-
-def ICEscan(contig_id, prokka_dir, ice_dir) -> Path:
-	logging.info("Running Macsyfinder on ICEscan model")
-	anno_fa = prokka_dir / f'{contig_id}.faa'
-	ice_res = ice_dir / 'all_systems.tsv'
-
-	cmd = [
-		'macsyfinder',
-		'--db-type', 'ordered_replicon',
-		'--models-dir', Path(__file__).parents[1] / 'data' / 'macsydata',
-		'--models', 'ICEscan', 'all',
-		'--replicon-topology', 'linear',
-		'--coverage-profile', '0.3',
-		'--sequence-db', anno_fa,
-		'-o', ice_res
-	]
-
-	try:
-		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
-	except subprocess.CalledProcessError as e:
-		logging.error(f"Macsyfinder execution failed: {e}")
-
-	return ice_res
 
 
 
@@ -324,121 +133,88 @@ def calculate_gc(fasta_file, start, end, window_size, step_size):
 		j += 0.05
 
 	gcdict = {
-		        'xData':pos,
-		        'datasets':[{
-		            'name':'',
-		            'data':gc_contents,
-		            'unit':'%',
-		            'type':'line',
-		            "valueDecimals": 1
-		        }]
-	    }
+				'xData':pos,
+				'datasets':[{
+					'name':'',
+					'data':gc_contents,
+					'unit':'%',
+					'type':'line',
+					"valueDecimals": 1
+				}]
+		}
 
 	return gcdict
 
+def pos_tag(position: int, pos_dict: Dict[str, Tuple[str, str]], current_index: int, current_final: int, total_genes: int, direction: str) -> Tuple[int, int]:
+	"""
+	Adjust an ICE gene index and its boundary based on a genomic position.
 
-def getgff(run_id):
-
-	gffile = os.path.join(gb_dir, run_id + '.gff')
-	with open(gffile,'r') as gffin:
-		trnadict = {}
-		posdict = {}
-		for line in gffin.readlines():
-			if 'ID=' in line:
-				lines = line.strip().split('\t')
-				ids = lines[8].split(';')[0].split('=')[1]
-				header = ids.split('_')[0]
-				product = lines[8].split('product=')[1]
-				pos = [lines[3],lines[4],lines[6],product]
-				if lines[2] == 'tRNA' or lines[2] == 'tmRNA':
-					trnadict[ids] = product
-				posdict[ids] = pos
-				totalnum = getnum(ids)
-
-	return trnadict,posdict,header,totalnum
-
-def getnum(ID):
-
-	return int(ID.split('_')[1].lstrip("0"))
-
-def find_max_distance(numbers):
-	max_distance = -1
-	max_distance_index = -1
-
-	for i in range(len(numbers) - 1):
-		distance = abs(numbers[i] - numbers[i+1])
-		if distance > max_distance:
-			max_distance = distance
-			max_distance_index = i
-
-	if max_distance_index == -1:
-		return None
-
-	return numbers[max_distance_index], numbers[max_distance_index + 1]
-
-def pos_tag(pos,posdict,ICE,final,totalnum,dirtag):
-
-	tICE = ICE
-	tfinal = final
-	for k,v in posdict.items():
-		vstart,vend = int(v[0]),int(v[1])
-		if int(pos) <= vend:
-			if dirtag == 's':
-				tICE = getnum(k)
-				tfinal = max(1, tICE - 5)
+	- `direction` 's' updates start side; 'e' updates end side.
+	"""
+	# Iterate through sorted entries to find the first covering interval
+	for key, (start_s, end_s) in pos_dict.items():
+		start_i, end_i = int(start_s), int(end_s)
+		if position <= end_i:
+			if direction == 's':
+				new_index = get_num(key)
+				new_final = max(1, new_index - 5)
 			else:
-				if vstart > int(pos):
-					tICE = getnum(k) - 1 
-				else:
-					tICE = getnum(k)
-				tfinal = min(totalnum, tICE + 5)
-			break
-	return tICE, tfinal
+				# Move index back one if the DR start is before this interval
+				idx = get_num(key)
+				new_index = idx - 1 if start_i > position else idx
+				new_final = min(total_genes, new_index + 5)
+			return new_index, new_final
 
-def merge_tRNA(run_id,ICEdict,DRlist):
+	# If not found, return original
+	return current_index, current_final
 
-	trnadict,posdict,header,totalnum = getgff(run_id)
-	fICE = getnum(next(iter(ICEdict)))
-	eICE = getnum(list(ICEdict.keys())[-1])
+def merge_tRNA(run_id: str, ice_dict: dict, dr_list: List, prokka_dir: Path) -> Tuple[List, Dict, str, List]:
+	
+	# Load annotations
+	gff_path = prokka_dir / f"{run_id}.gff"
+	trna_dict, pos_dict, header, total_genes = get_gff(gff_path)
+
+	fICE = get_num(next(iter(ice_dict)))
+	eICE = get_num(list(ice_dict.keys())[-1])
 
 	nfICEnum = max(1, fICE - 5)
-	neICEnum = min(totalnum, eICE + 5)
+	neICEnum = min(total_genes, eICE + 5)
 
 	ICEtagnum = [nfICEnum,neICEnum]
 	trnalist = []
-	for key,value in trnadict.items():
-		if nfICEnum <= getnum(key) <= neICEnum:
-			ICEtagnum.append(getnum(key))
+	for key,value in trna_dict.items():
+		if nfICEnum <= get_num(key) <= neICEnum:
+			ICEtagnum.append(get_num(key))
 			trnalist.append(value)
 
 	ICEtagnum.sort()
 	finalstart,finalend = find_max_distance(ICEtagnum)
 
-	myDR1 = posdict[zill(header,fICE)][0]
+	myDR1 = pos_dict[zill(header,fICE)][0]
 	myDR2 = ''
 	myDR3 = ''
-	myDR4 = posdict[zill(header,eICE)][1]
+	myDR4 = pos_dict[zill(header,eICE)][1]
 
 	if trnalist:
 		if finalstart == nfICEnum:
 			eICE = finalend
-			finalend = min(totalnum, finalend + 5)
-			myDR4 = posdict[zill(header,eICE)][1]					
-			for line in DRlist:
+			finalend = min(total_genes, finalend + 5)
+			myDR4 = pos_dict[zill(header,eICE)][1]					
+			for line in dr_list:
 				DRs = line.split('|')
 				if int(DRs[3]) - int(DRs[0]) > 500000:
 					continue
 				if int(DRs[3]) - int(DRs[0]) < 5000:
 					continue					
-				if int(posdict[zill(header,eICE)][0]) < int(DRs[3]) < int(posdict[zill(header,eICE)][1]):
+				if int(pos_dict[zill(header,eICE)][0]) < int(DRs[3]) < int(pos_dict[zill(header,eICE)][1]):
 					checktrna = 0
-					for key,value in trnadict.items():
+					for key,value in trna_dict.items():
 						if int(DRs[0]) <= value[0] <= int(DRs[3]) and int(DRs[0]) <= value[1] <= int(DRs[3]):
 							checktrna += 1
 					if checktrna >= 2:
 						break
 
-					fICE,finalstart = pos_tag(DRs[0],posdict,fICE,finalstart,totalnum,'s')
+					fICE,finalstart = pos_tag(DRs[0],pos_dict,fICE,finalstart,total_genes,'s')
 					myDR1 = DRs[0]
 					myDR2 = DRs[1]
 					myDR3 = DRs[2]
@@ -448,96 +224,114 @@ def merge_tRNA(run_id,ICEdict,DRlist):
 		elif finalend == neICEnum:
 			fICE = finalstart
 			finalstart =  max(1, finalstart - 5)
-			myDR1 = posdict[zill(header,fICE)][0]
-			for line in DRlist:
+			myDR1 = pos_dict[zill(header,fICE)][0]
+			for line in dr_list:
 				DRs = line.split('|')
 				if int(DRs[3]) - int(DRs[0]) > 500000:
 					continue	
 				if int(DRs[3]) - int(DRs[0]) < 5000:
 					continue									
-				if int(posdict[zill(header,fICE)][0]) < int(DRs[0]) < int(posdict[zill(header,fICE)][1]):
+				if int(pos_dict[zill(header,fICE)][0]) < int(DRs[0]) < int(pos_dict[zill(header,fICE)][1]):
 					checktrna = 0
-					for key,value in trnadict.items():
+					for key,value in trna_dict.items():
 						if int(DRs[0]) <= value[0] <= int(DRs[3]) and int(DRs[0]) <= value[1] <= int(DRs[3]):
 							checktrna += 1
 					if checktrna >= 2:
 						break
-					eICE,finalend = pos_tag(DRs[3],posdict,eICE,finalend,totalnum,'e')
+					eICE,finalend = pos_tag(DRs[3],pos_dict,eICE,finalend,total_genes,'e')
 					myDR1 = DRs[0]
 					myDR2 = DRs[1]
 					myDR3 = DRs[2]
 					myDR4 = DRs[3]									
 					break
 
-	return myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,posdict,header,trnalist
+	return [myDR1, myDR2, myDR3, myDR4, fICE, eICE, finalstart, finalend], pos_dict, header, trnalist
 
-def get_DR(run_id,input):
+	# print(trna_data)
+	# # ICE gene indices sorted
+	# ice_nums = sorted(get_num(k) for k in ice_dict)
+	# first_ice, last_ice = ice_nums[0], ice_nums[-1]
 
-	DRindex = os.path.join(tmp_dir, run_id, run_id+'_DR')
-	DRout = os.path.join(tmp_dir, run_id, run_id+'_DRout')
-	maktree_cmd = './tool/mkvtree -db ' + input +' -indexname '+ DRindex +' -dna -pl -lcp -suf -tis -ois -bwt -bck -sti1'
-	vmatch_cmd = './tool/vmatch -l 15 '+ DRindex + ' > '+ DRout
-	os.system(maktree_cmd)
-	os.system(vmatch_cmd)
+	# # Initial window
+	# start_win = max(1, first_ice - 5)
+	# end_win = min(total_genes, last_ice + 5)
 
-	DRlist = []
-	with open(DRout,'r') as DRin:
-		for line in DRin.readlines():
-			lines = line.strip().split()
-			if not line.startswith('#'):
-				DR = [lines[2],str(int(lines[2])+int(lines[0])),lines[6],str(int(lines[6])+int(lines[4]))]
-				DRlist.append('|'.join(DR))
-	return DRlist
+	# # Collect tRNA positions
+	# ice_positions = [start_win, end_win]
+	# tRNA_ranges: List[Tuple[int, int]] = []
+	# for key, coords in trna_data.items():
+	# 	print(trna_data)
+	# 	s, e = coords
+	# 	idx = get_num(key)
+	# 	if start_win <= idx <= end_win:
+	# 		ice_positions.append(idx)
+	# 		tRNA_ranges.append((s, e))
+	# ice_positions.sort()
 
-def get_ICE(contig_id, input, ice_dir, prokka_dir):
+	# # Initialize DRs
+	# dr1 = pos_data[zill(header, start_win)][0]
+	# dr2 = ''
+	# dr3 = ''
+	# dr4 = pos_data[zill(header, end_win)][1]
 
-	ice_res = ICEscan(contig_id, prokka_dir, ice_dir)
+	# # Adjust window by largest gap
+	# gap = find_max_distance(ice_positions)
+	# if gap:
+	# 	final_start, final_end = gap
+	# else:
+	# 	final_start, final_end = start_win, end_win
 
-	with open(ice_res,'r') as ICEin:
-		ICEdict = {}
-		infodict = {}
-		for line in ICEin.readlines():
-			if 'Chromosome' in line:
-				lines = line.strip().split('\t')
-				if 'UserReplicon_IME' not in lines[5]:
-					gbname = lines[1]
-					tags = get_feat(lines[2])
-					mpf = lines[4].split('/')[-1].split('_')[1]
+	# # Attempt extension if there are tRNAs
+	# if tRNA_ranges:
+	# 	extend_start = (final_start == start_win)
+	# 	extend_end = (final_end == end_win)
 
-					if 'Relaxase@' in tags:
-						mob = tags.split('@')[1]
-					else:
-						mob = ''
-					ICEtag = 'ICE'+lines[5].split('_')[-1]
+	# 	if extend_start or extend_end:
+	# 		if extend_start:
+	# 			end_win = min(total_genes, final_end + 5)
+	# 			gene_key = zill(header, end_win)
+	# 		else:
+	# 			start_win = max(1, final_start - 5)
+	# 			gene_key = zill(header, start_win)
 
-					ICEdict.setdefault(ICEtag,{})[gbname]=tags
+	# 		gene_s, gene_e = map(int, pos_data[gene_key])
 
-					if ICEtag not in infodict:
-						infodict[ICEtag] = {'mob': [], 'mpf': []}
-					if mob not in infodict[ICEtag]['mob']:
-						if mob:
-							infodict[ICEtag]['mob'].append(mob)
-					if mpf not in infodict[ICEtag]['mpf']:
-						infodict[ICEtag]['mpf'].append(mpf)	
+	# 		for dr_line in dr_list:
+	# 			a, b, c, d = map(int, dr_line.split('|'))
+	# 			length = d - a
+	# 			if not 5000 <= length <= 500000:
+	# 				continue
+
+	# 			coord = d if extend_start else a
+	# 			if not (gene_s < coord < gene_e):
+	# 				continue
+
+	# 			inside = sum(1 for (ts, te) in tRNA_ranges if a <= ts <= d and a <= te <= d)
+	# 			if inside >= 2:
+	# 				continue
+
+	# 			if extend_start:
+	# 				start_win, final_start = pos_tag(a, pos_data, start_win, final_start, total_genes, 's')
+	# 			else:
+	# 				end_win, final_end = pos_tag(d, pos_data, end_win, final_end, total_genes, 'e')
+
+	# 			dr1, dr2, dr3, dr4 = dr_line.split('|')
+	# 			break
+	# 	return (dr1, dr2, dr3, dr4,
+	# 	  		start_win, end_win,
+	# 			final_start, final_end,
+	# 			pos_data, header, tRNA_ranges)
+
+
+def ice_markers(contig_id: str, prokka_dir: Path, ice_dict: dict, dr_list: List):
 
 	dictICE = {}
-	posdict = {}
+	pos_dict = {}
 	trnalist = []
 	header = ''
-	DRlist = get_DR(contig_id,input)
-	for key,value in ICEdict.items():
-		myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend,posdict,header,trnalist = merge_tRNA(contig_id,value,DRlist)
-		dictICE[key] = [myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend]
-
-	return dictICE,ICEdict,posdict,header,trnalist,infodict
-
-def args(run_id):
-
-	return getblast(run_id)
-
-def zill(header,num):
-
-	return header+ '_' +str(num).zfill(5)
+	for key, value in ice_dict.items():
+		dictICE[key], pos_dict, header, trnalist = merge_tRNA(contig_id, value, dr_list, prokka_dir)
+	return dictICE, ice_dict, pos_dict, header, trnalist
 
 def get_args(argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict,gene,feature,product):
 
@@ -599,28 +393,6 @@ def oritseq(run_id, regi, input, start, end):
 					break
 	return oritseq
 
-def get_feat(feat):
-
-	featuredict = {
-		'Phage_integrase':'Integrase','UPF0236':'Integrase',
-        'Recombinase':'Integrase','rve':'Integrase',
-        'TIGR02224':'Integrase','TIGR02249':'Integrase',
-        'TIGR02225':'Integrase','PB001819':'Integrase'
-	}
-	if feat in featuredict:
-		return 'Integrase@'+feat
-	elif 'T4SS_MOB' in feat:
-		tag = feat.split('_')[1]
-		return 'Relaxase@'+tag
-	elif 't4cp' in feat:
-		tag = feat.split('_')[1]
-		return 'T4CP@' + tag
-	elif 'tcpA' in feat:
-		tag = feat.split('_')[1]
-		return 'T4CP@' + tag
-	else:
-		return 'T4SS@'+feat.replace('T4SS_','')
-
 def getcolor(feature,product):
 
 	coldict = {'DR':'black','Gene':'#C0C0C0',
@@ -632,12 +404,12 @@ def getcolor(feature,product):
 	}
 
 	namedict = {'Hyp':'Hypothetical protein','Gene':'Other gene',
-		    'AR':'Antibiotic resistance gene',
-		    'VF':'Virulence factor','Metal':'Metal resistance',
-		    'Flank':'Flank region','Defense':'Defense system',
-		    'Transposase':'Transposase','Relaxase':'Relaxase',
-		    'T4CP':'T4CP','T4SS':'T4SS','Integrase':'Integrase',
-		    'Degradation':'Degradation','Symbiosis':'Symbiosis'
+			'AR':'Antibiotic resistance gene',
+			'VF':'Virulence factor','Metal':'Metal resistance',
+			'Flank':'Flank region','Defense':'Defense system',
+			'Transposase':'Transposase','Relaxase':'Relaxase',
+			'T4CP':'T4CP','T4SS':'T4SS','Integrase':'Integrase',
+			'Degradation':'Degradation','Symbiosis':'Symbiosis'
 	}
 
 	if 'Integrase' in feature:
@@ -686,21 +458,31 @@ def getfa(input,s,e):
 	sequence = seq_record.seq[int(s):int(e)]
 	return str(sequence)
 
-def get_map(contig_id: str, id_dict, fasta_file: Path, outdir: Path, prokka_dir: Path):
-	print(outdir, contig_id)
+def charact_contig(contig_id: str, id_dict, fasta_file: Path, outdir: Path):
+
+	# Output paths and files
 	js_dir = outdir / 'js'
 	js_dir.mkdir(exist_ok=True)
 	gc_map = outdir / 'script' / 'js' / 'gcmap.js'
 	view_file = outdir / 'script' / 'js' / 'view.html'
 	ice_dir = outdir / f'{contig_id}_ICE'
-	# Aquí da fallo, ¿no está borrando?
-	if ice_dir.exists() and ice_dir.is_dir():
-		print(f"removing {ice_dir}")
-		shutil.rmtree(ice_dir)
+	shutil.rmtree(ice_dir,ignore_errors=True)
 	ice_dir.mkdir()
 
-	dictICE,ICEdict,posdict,header,trnalist,infodict = get_ICE(contig_id, fasta_file, ice_dir, prokka_dir)
-	argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict = args(contig_id)
+	# Contig annotation
+	prokka_dir = prokka(contig_id, fasta_file)
+	ice_dict, info_dict = ICEscan(contig_id, prokka_dir, ice_dir)
+	dr_list = get_dr(contig_id, fasta_file, ice_dir)
+
+	########################################
+	################# AQUI #################
+	########################################
+	dictICE, ice_dict, pos_dict, header, trnalist = ice_markers(contig_id, prokka_dir, ice_dict, dr_list)
+	outblast = outdir / 'blast'
+	outblast.mkdir(parents=True, exist_ok=True)
+	argdict = blastn_all(prokka_dir / f'{contig_id}.ffn', outdir / 'blast')
+	isdict, vfdict, metaldict, popdict, symdict = blastp_all(prokka_dir / f'{contig_id}.faa', outdir / 'blast')
+	dfdict = defense_finder(prokka_dir / f'{contig_id}.faa', outdir / 'defense_finder')
 
 	ICEss = {}
 	for key,value in dictICE.items():
@@ -712,12 +494,12 @@ def get_map(contig_id: str, id_dict, fasta_file: Path, outdir: Path, prokka_dir:
 		gcjson = os.path.join(js_dir,regijs+'_gc.js')
 		mapfile = os.path.join(js_dir,regijs+'.js')
 		htmlfile = os.path.join(outdir,regi+'.html')
-		[myDR1,myDR2,myDR3,myDR4,fICE,eICE,finalstart,finalend] = value
+		[myDR1,myDR2,myDR3,myDR4,first_gene,last_gene,finalstart,finalend] = value
 
 		start = finalstart
-		while start < fICE:
+		while start < first_gene:
 			gene = zill(header,start)
-			s,e,strand,pro = posdict[gene]
+			s,e,strand,pro = pos_dict[gene]
 			pos = s+'..'+e+' ['+strand+'], '+str(int(e)-int(s)+1)
 
 			feature = 'Flank'
@@ -735,14 +517,14 @@ def get_map(contig_id: str, id_dict, fasta_file: Path, outdir: Path, prokka_dir:
 			}
 			genelist.append(content)
 
-		mov = fICE
-		while mov <= eICE:
+		mov = first_gene
+		while mov <= last_gene:
 			gene = zill(header,mov)
-			s,e,strand,pro = posdict[gene]
+			s,e,strand,pro = pos_dict[gene]
 			pos = s+'..'+e+' ['+strand+'], '+str(int(e)-int(s)+1)
 
-			if gene in ICEdict[key]:
-				[feature,pro11] = ICEdict[key][gene].split('@')
+			if gene in ice_dict[key]:
+				[feature,pro11] = ice_dict[key][gene].split('@')
 			else:
 				feature,pro11 = '',''
 
@@ -766,7 +548,7 @@ def get_map(contig_id: str, id_dict, fasta_file: Path, outdir: Path, prokka_dir:
 
 		while mov <= finalend:
 			gene = zill(header,mov)
-			s,e,strand,pro = posdict[gene]
+			s,e,strand,pro = pos_dict[gene]
 			pos = s+'..'+e+' ['+strand+'], '+str(int(e)-int(s)+1)
 
 			feature = 'Flank'
@@ -789,14 +571,14 @@ def get_map(contig_id: str, id_dict, fasta_file: Path, outdir: Path, prokka_dir:
 
 		contigID = contig_id.split('_', 1)[1]
 
-		sgene = zill(header,fICE)
-		egene = zill(header,eICE)
-		s1,e1,strand1,pro1 = posdict[sgene]
-		s2,e2,strand2,pro2 = posdict[egene]
+		sgene = zill(header,first_gene)
+		egene = zill(header,last_gene)
+		s1,e1,strand1,pro1 = pos_dict[sgene]
+		s2,e2,strand2,pro2 = pos_dict[egene]
 		if myDR1 == '0':
 			myDR1 = '1'
 
-		ICEss[regi] = '|'.join([myDR1,myDR4,str(fICE),str(eICE)])
+		ICEss[regi] = '|'.join([myDR1,myDR4,str(first_gene),str(last_gene)])
 
 		# host = spdict[contigID]
 		host = "-"
@@ -820,8 +602,8 @@ def get_map(contig_id: str, id_dict, fasta_file: Path, outdir: Path, prokka_dir:
 			'Length (bp)':str(int(e2)-int(s1)+1),
 			'oriT seq':oritseqs,
 			'DRs':DRw,
-			'Relaxase Type': ','.join(infodict[key]['mob']),
-			'Mating pair formation systems':','.join(infodict[key]['mpf']),
+			'Relaxase Type': ','.join(info_dict[key]['mob']),
+			'Mating pair formation systems':','.join(info_dict[key]['mpf']),
 			'Close to tRNA':','.join(trnalist)
 		}
 		with open(infofile,'w') as info_file:
@@ -913,7 +695,7 @@ def getfasta(run_id,resultdir,id_dict,key,s,e,stag,etag):
 	faa_records = SeqIO.parse(faafile, "fasta")
 	with open(outfaa, "w") as output_handle2:
 		for faa_record in faa_records:
-			seq_id = getnum(faa_record.id)
+			seq_id = get_num(faa_record.id)
 			if int(stag) <= seq_id <= int(etag):
 				SeqIO.write(faa_record, output_handle2, "fasta")
 
@@ -928,26 +710,25 @@ def _meta(run_id: str, input: Path, outdir: Path, kraken_db: Union[Path, None], 
 	chosen_contigs = prescan(run_id, input, outdir)
 
 	# Taxonomy assignation (optional)
-	drawout = None
 	spdict = {}
 	report = None
 	if kraken_db:
-		drawout,spdict,report = taxonomy(run_id, input, outdir, kraken_db)
+		spdict,report = kraken2(run_id, input, outdir, kraken_db)
 		copy_files(report, outdir)
-		copy_files(drawout, outdir)
 
 	# Get basic information from input
-	basefile = getbase(run_id, input, outdir)
+	basefile = seqkit(run_id, input, outdir)
 	copy_files(basefile, outdir)
 
 	#############################################################
 	##################### Por aquí me quedé #####################
 	#############################################################
-	ICEsum = outdir / tmp_dir / f'{run_id}_ICEsum.json'
+	
 	i = 1 
-	ICEsumlist = []
+	ice_summary = []
 	for seq_record in SeqIO.parse(input, "fasta"):
 		if seq_record.id in chosen_contigs:
+			logging.info(f"Analyzing contig {seq_record.id}")
 
 			# Extract contig of interest in fasta format
 			contig_folder = outdir / tmp_dir / f'{seq_record.id}'
@@ -956,9 +737,8 @@ def _meta(run_id: str, input: Path, outdir: Path, kraken_db: Union[Path, None], 
 			with contig_fasta.open("w") as oh:
 				SeqIO.write(seq_record, oh, "fasta")
 
-			# Annotate contig
-			prokka_dir = prokka(seq_record.id, contig_fasta)
-			ICEss = get_map(seq_record.id, id_dict, contig_fasta, contig_folder, prokka_dir)
+			# Characterize contig
+			ICEss = charact_contig(seq_record.id, id_dict, contig_fasta, contig_folder)
 			copy_files(contig_folder, outdir)
 
 			if ICEss:
@@ -967,19 +747,20 @@ def _meta(run_id: str, input: Path, outdir: Path, kraken_db: Union[Path, None], 
 					lengt = int(e) - int(s) + 1
 					ICEs = {
 						'id' : str(i),
-				        'seqid': id_dict[seq_record.id],
-				        # 'species':spdict[seq_record.id],
+						'seqid': id_dict[seq_record.id],
+						# 'species':spdict[seq_record.id],
 						'species':'',
-				        'location': s+'..'+e,
-				        'length': lengt,
-				        'detail': key
-				    }
-					ICEsumlist.append(ICEs)
+						'location': s+'..'+e,
+						'length': lengt,
+						'detail': key
+					}
+					ice_summary.append(ICEs)
 					getfasta(seq_record.id,outdir,id_dict,key,s,e,stag,etag)
 					i += 1 
 
+	ICEsum = outdir / tmp_dir / f'{run_id}_ICEsum.json'
 	with open(ICEsum,'w') as ice_file:
-		json.dump(ICEsumlist, ice_file, indent=4)
+		json.dump(ice_summary, ice_file, indent=4)
 
 	copy_files(ICEsum, outdir)
 	jsdir = os.path.join(outdir,'js')
