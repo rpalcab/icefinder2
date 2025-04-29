@@ -119,3 +119,12 @@ def find_max_distance(numbers: List[int]) -> Optional[Tuple[int, int]]:
         return None
     # Evaluate pairs and pick the one with max gap
     return max(zip(numbers, numbers[1:]), key=lambda pair: abs(pair[1] - pair[0]))
+
+def candidate_setup(seq_record, outdir: Path) -> Tuple[Path, Path]:
+	contig_folder = outdir / 'tmp' / f'{seq_record.id}'
+	contig_folder.mkdir(exist_ok=True)
+	contig_fasta = contig_folder / f'{seq_record.id}.fasta'
+	with contig_fasta.open("w") as oh:
+		SeqIO.write(seq_record, oh, "fasta")
+	return contig_folder, contig_fasta
+

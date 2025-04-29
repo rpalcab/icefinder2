@@ -6,14 +6,14 @@ import json
 import shutil
 import logging
 from pathlib import Path
-from typing import List, Union, Tuple, Dict
+from typing import List, Union, Tuple, Dict, Any, Sequence
 import pandas as pd
 
 from Bio import SeqIO
 from Bio.SeqUtils import GC
 from script.config import get_param
-from script.utils import copy_files, zill, get_gff, get_num, find_max_distance
-from script.commands import kraken2, prodigal, seqkit, hmmscan, prokka, ICEscan, get_dr, blastn_all, blastp_all, defense_finder
+from script.utils import copy_files, zill, get_gff, get_num, find_max_distance, candidate_setup
+from script.process import kraken2, prodigal, seqkit, hmmscan, process_hmmscan, prokka, ICEscan, get_dr, blastn_all, blastp_all, defense_finder
 
 logging.basicConfig(
 		level=logging.INFO,
@@ -34,46 +34,12 @@ gb_dir = os.path.join(tmp_dir,'gbk') # AHORA ES EL OUTPUT DE PROKKA
 
 
 # Refactored
-def scanf(hmmlist: List) -> bool:
-
-	ice_count = []
-	for line in hmmlist:
-		if 'MOB' in line:
-			ice_count.append('MOB')
-		elif 't4cp' in line or 'tcpA' in line:
-			ice_count.append('t4cp')
-		elif 'FA' in line:
-			ice_count.append('T4SS')
-		elif line in [
-					 'Phage_integrase', 'UPF0236',
-					 'Recombinase', 'rve', 'TIGR02224',
-					 'TIGR02249', 'TIGR02225', 'PB001819'
-					 ]:
-			ice_count.append('Int')
-		else:
-			ice_count.append('T4SS')
-	if ice_count.count('MOB') and ice_count.count('t4cp') and ice_count.count('Int') and ice_count.count('T4SS') >= 5:
-		return True
-	else:
-		return False
 
 def prescan(run_id: str, input: Path, outdir: Path) -> List:
 	anno_fa = prodigal(run_id, input, outdir)
 	scan_file = hmmscan(run_id, input, outdir, anno_fa)
-
-	df = pd.read_table(scan_file, sep=r"\s+", comment='#', header=None, usecols=range(5), 
-					   names=['target_name', 'accession', 'query_name', 'accession_fs', 'E-value_fs'])
-	df.drop_duplicates(subset='query_name', inplace=True)
-	df['key'] = df['query_name'].str.split('_').str[:-1].str.join('_')
-
-	chosen = []
-	for k, group in df.groupby('key'):
-		if scanf(group['target_name'].tolist()):
-			chosen.append(k)
-
-	return chosen
-
-
+	candidates = process_hmmscan(scan_file)
+	return candidates
 
 # Unsure
 def rename(run_id, input):
@@ -168,170 +134,215 @@ def pos_tag(position: int, pos_dict: Dict[str, Tuple[str, str]], current_index: 
 	# If not found, return original
 	return current_index, current_final
 
-def merge_tRNA(run_id: str, ice_dict: dict, dr_list: List, prokka_dir: Path) -> Tuple[List, Dict, str, List]:
-	
-	# Load annotations
-	gff_path = prokka_dir / f"{run_id}.gff"
-	trna_dict, pos_dict, header, total_genes = get_gff(gff_path)
+# def merge_tRNA(run_id: str, ice_dict: dict, dr_df: pd.DataFrame, prokka_dir: Path) -> Tuple[List, Dict, str, List]:
+# 	# Load annotations
+# 	gff_path = prokka_dir / f"{run_id}.gff"
+# 	trna_dict, pos_dict, header, total_genes = get_gff(gff_path)
 
-	fICE = get_num(next(iter(ice_dict)))
-	eICE = get_num(list(ice_dict.keys())[-1])
+# 	fICE = get_num(next(iter(ice_dict)))
+# 	eICE = get_num(list(ice_dict.keys())[-1])
 
-	nfICEnum = max(1, fICE - 5)
-	neICEnum = min(total_genes, eICE + 5)
+# 	nfICEnum = max(1, fICE - 5)
+# 	neICEnum = min(total_genes, eICE + 5)
 
-	ICEtagnum = [nfICEnum,neICEnum]
-	trnalist = []
-	for key,value in trna_dict.items():
-		if nfICEnum <= get_num(key) <= neICEnum:
-			ICEtagnum.append(get_num(key))
-			trnalist.append(value)
+# 	ICEtagnum = [nfICEnum,neICEnum]
+# 	trnalist = []
+# 	for key,value in trna_dict.items():
+# 		if nfICEnum <= get_num(key) <= neICEnum:
+# 			ICEtagnum.append(get_num(key))
+# 			trnalist.append(value)
 
-	ICEtagnum.sort()
-	finalstart,finalend = find_max_distance(ICEtagnum)
+# 	ICEtagnum.sort()
+# 	finalstart,finalend = find_max_distance(ICEtagnum)
 
-	myDR1 = pos_dict[zill(header,fICE)][0]
-	myDR2 = ''
-	myDR3 = ''
-	myDR4 = pos_dict[zill(header,eICE)][1]
+# 	myDR1 = pos_dict[zill(header,fICE)][0]
+# 	myDR2 = ''
+# 	myDR3 = ''
+# 	myDR4 = pos_dict[zill(header,eICE)][1]
 
-	if trnalist:
-		if finalstart == nfICEnum:
-			eICE = finalend
-			finalend = min(total_genes, finalend + 5)
-			myDR4 = pos_dict[zill(header,eICE)][1]					
-			for line in dr_list:
-				DRs = line.split('|')
-				if int(DRs[3]) - int(DRs[0]) > 500000:
-					continue
-				if int(DRs[3]) - int(DRs[0]) < 5000:
-					continue					
-				if int(pos_dict[zill(header,eICE)][0]) < int(DRs[3]) < int(pos_dict[zill(header,eICE)][1]):
-					checktrna = 0
-					for key,value in trna_dict.items():
-						if int(DRs[0]) <= value[0] <= int(DRs[3]) and int(DRs[0]) <= value[1] <= int(DRs[3]):
-							checktrna += 1
-					if checktrna >= 2:
-						break
+# 	if trnalist:
+# 		if finalstart == nfICEnum:
+# 			eICE = finalend
+# 			finalend = min(total_genes, finalend + 5)
+# 			myDR4 = pos_dict[zill(header,eICE)][1]					
+# 			for line in dr_list:
+# 				DRs = line.split('|')
+# 				if int(DRs[3]) - int(DRs[0]) > 500000:
+# 					continue
+# 				if int(DRs[3]) - int(DRs[0]) < 5000:
+# 					continue					
+# 				if int(pos_dict[zill(header,eICE)][0]) < int(DRs[3]) < int(pos_dict[zill(header,eICE)][1]):
+# 					checktrna = 0
+# 					for key,value in trna_dict.items():
+# 						if int(DRs[0]) <= value[0] <= int(DRs[3]) and int(DRs[0]) <= value[1] <= int(DRs[3]):
+# 							checktrna += 1
+# 					if checktrna >= 2:
+# 						break
 
-					fICE,finalstart = pos_tag(DRs[0],pos_dict,fICE,finalstart,total_genes,'s')
-					myDR1 = DRs[0]
-					myDR2 = DRs[1]
-					myDR3 = DRs[2]
-					myDR4 = DRs[3]
-					break
+# 					fICE,finalstart = pos_tag(DRs[0],pos_dict,fICE,finalstart,total_genes,'s')
+# 					myDR1 = DRs[0]
+# 					myDR2 = DRs[1]
+# 					myDR3 = DRs[2]
+# 					myDR4 = DRs[3]
+# 					break
 
-		elif finalend == neICEnum:
-			fICE = finalstart
-			finalstart =  max(1, finalstart - 5)
-			myDR1 = pos_dict[zill(header,fICE)][0]
-			for line in dr_list:
-				DRs = line.split('|')
-				if int(DRs[3]) - int(DRs[0]) > 500000:
-					continue	
-				if int(DRs[3]) - int(DRs[0]) < 5000:
-					continue									
-				if int(pos_dict[zill(header,fICE)][0]) < int(DRs[0]) < int(pos_dict[zill(header,fICE)][1]):
-					checktrna = 0
-					for key,value in trna_dict.items():
-						if int(DRs[0]) <= value[0] <= int(DRs[3]) and int(DRs[0]) <= value[1] <= int(DRs[3]):
-							checktrna += 1
-					if checktrna >= 2:
-						break
-					eICE,finalend = pos_tag(DRs[3],pos_dict,eICE,finalend,total_genes,'e')
-					myDR1 = DRs[0]
-					myDR2 = DRs[1]
-					myDR3 = DRs[2]
-					myDR4 = DRs[3]									
-					break
+# 		elif finalend == neICEnum:
+# 			fICE = finalstart
+# 			finalstart =  max(1, finalstart - 5)
+# 			myDR1 = pos_dict[zill(header,fICE)][0]
+# 			for line in dr_list:
+# 				DRs = line.split('|')
+# 				if int(DRs[3]) - int(DRs[0]) > 500000:
+# 					continue	
+# 				if int(DRs[3]) - int(DRs[0]) < 5000:
+# 					continue									
+# 				if int(pos_dict[zill(header,fICE)][0]) < int(DRs[0]) < int(pos_dict[zill(header,fICE)][1]):
+# 					checktrna = 0
+# 					for key,value in trna_dict.items():
+# 						if int(DRs[0]) <= value[0] <= int(DRs[3]) and int(DRs[0]) <= value[1] <= int(DRs[3]):
+# 							checktrna += 1
+# 					if checktrna >= 2:
+# 						break
+# 					eICE,finalend = pos_tag(DRs[3],pos_dict,eICE,finalend,total_genes,'e')
+# 					myDR1 = DRs[0]
+# 					myDR2 = DRs[1]
+# 					myDR3 = DRs[2]
+# 					myDR4 = DRs[3]									
+# 					break
 
-	return [myDR1, myDR2, myDR3, myDR4, fICE, eICE, finalstart, finalend], pos_dict, header, trnalist
+# 	return [myDR1, myDR2, myDR3, myDR4, fICE, eICE, finalstart, finalend], pos_dict, header, trnalist
 
-	# print(trna_data)
-	# # ICE gene indices sorted
-	# ice_nums = sorted(get_num(k) for k in ice_dict)
-	# first_ice, last_ice = ice_nums[0], ice_nums[-1]
+def load_and_collect(
+    run_id: str,
+    ice_dict: Dict[str, Any],
+    prokka_dir: Path
+) -> Tuple[Dict[str, Sequence[str]], str, int, int, int, int, List[Tuple[int,int]], List[int]]:
+    """
+    Load GFF, extract ICE gene window, and gather tRNA positions.
 
-	# # Initial window
-	# start_win = max(1, first_ice - 5)
-	# end_win = min(total_genes, last_ice + 5)
+    Returns:
+      - trna_data, pos_data, header, total_genes,
+      - start_win, end_win,
+      - tRNA_ranges, ice_positions
+    """
+    gff_path = prokka_dir / f"{run_id}.gff"
+    trna_data, pos_data, header, total_genes = get_gff(gff_path)
 
-	# # Collect tRNA positions
-	# ice_positions = [start_win, end_win]
-	# tRNA_ranges: List[Tuple[int, int]] = []
-	# for key, coords in trna_data.items():
-	# 	print(trna_data)
-	# 	s, e = coords
-	# 	idx = get_num(key)
-	# 	if start_win <= idx <= end_win:
-	# 		ice_positions.append(idx)
-	# 		tRNA_ranges.append((s, e))
-	# ice_positions.sort()
+    ice_nums = sorted(get_num(k) for k in ice_dict)
+    first_ice, last_ice = ice_nums[0], ice_nums[-1]
+    start_win = max(1, first_ice - 5)
+    end_win = min(total_genes, last_ice + 5)
 
-	# # Initialize DRs
-	# dr1 = pos_data[zill(header, start_win)][0]
-	# dr2 = ''
-	# dr3 = ''
-	# dr4 = pos_data[zill(header, end_win)][1]
-
-	# # Adjust window by largest gap
-	# gap = find_max_distance(ice_positions)
-	# if gap:
-	# 	final_start, final_end = gap
-	# else:
-	# 	final_start, final_end = start_win, end_win
-
-	# # Attempt extension if there are tRNAs
-	# if tRNA_ranges:
-	# 	extend_start = (final_start == start_win)
-	# 	extend_end = (final_end == end_win)
-
-	# 	if extend_start or extend_end:
-	# 		if extend_start:
-	# 			end_win = min(total_genes, final_end + 5)
-	# 			gene_key = zill(header, end_win)
-	# 		else:
-	# 			start_win = max(1, final_start - 5)
-	# 			gene_key = zill(header, start_win)
-
-	# 		gene_s, gene_e = map(int, pos_data[gene_key])
-
-	# 		for dr_line in dr_list:
-	# 			a, b, c, d = map(int, dr_line.split('|'))
-	# 			length = d - a
-	# 			if not 5000 <= length <= 500000:
-	# 				continue
-
-	# 			coord = d if extend_start else a
-	# 			if not (gene_s < coord < gene_e):
-	# 				continue
-
-	# 			inside = sum(1 for (ts, te) in tRNA_ranges if a <= ts <= d and a <= te <= d)
-	# 			if inside >= 2:
-	# 				continue
-
-	# 			if extend_start:
-	# 				start_win, final_start = pos_tag(a, pos_data, start_win, final_start, total_genes, 's')
-	# 			else:
-	# 				end_win, final_end = pos_tag(d, pos_data, end_win, final_end, total_genes, 'e')
-
-	# 			dr1, dr2, dr3, dr4 = dr_line.split('|')
-	# 			break
-	# 	return (dr1, dr2, dr3, dr4,
-	# 	  		start_win, end_win,
-	# 			final_start, final_end,
-	# 			pos_data, header, tRNA_ranges)
+    tRNA_ranges: List[Tuple[int,int]] = []
+    ice_positions = [start_win, end_win]
+    for key, coords in trna_data.items():
+        idx = get_num(key)
+        if start_win <= idx <= end_win:
+            ice_positions.append(idx)
+            try:
+                s, e = int(coords[0]), int(coords[1])
+                tRNA_ranges.append((s, e))
+            except Exception:
+                continue
+    ice_positions.sort()
+    return trna_data, pos_data, header, total_genes, start_win, end_win, tRNA_ranges, ice_positions
 
 
-def ice_markers(contig_id: str, prokka_dir: Path, ice_dict: dict, dr_list: List):
+def adjust_window(
+    start_win: int,
+    end_win: int,
+    ice_positions: List[int]
+) -> Tuple[int, int]:
+    """
+    Adjust the ICE gene window by the largest gap in tRNA positions.
+    """
+    gap = find_max_distance(ice_positions)
+    if gap:
+        return gap
+    return start_win, end_win
 
-	dictICE = {}
-	pos_dict = {}
-	trnalist = []
-	header = ''
+
+def refine_dr_boundaries(
+    dr_df: pd.DataFrame,
+    pos_data: Dict[str, Sequence[str]],
+    header: str,
+    total_genes: int,
+    tRNA_ranges: List[Tuple[int,int]],
+    start_win: int,
+    end_win: int,
+    final_start: int,
+    final_end: int
+) -> Tuple[str, str, str, str, int, int, int, int]:
+    """
+    Find and refine direct repeat (DR) boundaries.
+    """
+    dr1 = pos_data[zill(header, start_win)][0]
+    dr4 = pos_data[zill(header, end_win)][1]
+    dr2 = dr3 = ''
+
+    extend_start = (final_start == start_win)
+    extend_end = (final_end == end_win)
+    if not (extend_start or extend_end):
+        return dr1, dr2, dr3, dr4, start_win, end_win, final_start, final_end
+
+    if extend_start:
+        end_win = min(total_genes, final_end + 5)
+        gene_key = zill(header, end_win)
+    else:
+        start_win = max(1, final_start - 5)
+        gene_key = zill(header, start_win)
+
+    gene_s, gene_e = map(int, pos_data[gene_key][:2])
+
+    for _, row in dr_df.iterrows():
+        a, b, c, d = map(int, (row['start1'], row['end1'], row['start2'], row['end2']))
+        length = d - a
+        if not 5000 <= length <= 500000:
+            continue
+        coord = d if extend_start else a
+        if not (gene_s < coord < gene_e):
+            continue
+        inside = sum(1 for ts, te in tRNA_ranges if a <= ts <= d and a <= te <= d)
+        if inside >= 2:
+            continue
+        if extend_start:
+            start_win, final_start = pos_tag(a, pos_data, start_win, final_start, total_genes, 's')
+        else:
+            end_win, final_end = pos_tag(d, pos_data, end_win, final_end, total_genes, 'e')
+        dr1, dr2, dr3, dr4 = map(str, (a, b, c, d))
+        break
+
+    return [dr1, dr2, dr3, dr4, start_win, end_win, final_start, final_end]
+
+
+def merge_trna(
+    run_id: str,
+    ice_dict: Dict[str, Any],
+    dr_df: pd.DataFrame,
+    prokka_dir: Path
+) -> Tuple[
+    str, str, str, str,
+    int, int, int, int,
+    Dict[str, Sequence[str]], str,
+    List[Tuple[int, int]]
+]:
+    trna_data, pos_data, header, total_genes, start_win, end_win, tRNA_ranges, ice_positions = load_and_collect(run_id, ice_dict, prokka_dir)
+
+    final_start, final_end = adjust_window(start_win, end_win, ice_positions)
+
+    dr_data = refine_dr_boundaries(
+        dr_df, pos_data, header, total_genes,
+        tRNA_ranges, start_win, end_win, final_start, final_end
+    )
+    return (dr_data, pos_data, header, tRNA_ranges)
+
+
+def ice_markers(contig_id: str, prokka_dir: Path, ice_dict: dict, dr_df: pd.DataFrame):
+
+	coords_dict = {}
 	for key, value in ice_dict.items():
-		dictICE[key], pos_dict, header, trnalist = merge_tRNA(contig_id, value, dr_list, prokka_dir)
-	return dictICE, ice_dict, pos_dict, header, trnalist
+		coords_dict[key], pos_dict, header, trnalist = merge_trna(contig_id, value, dr_df, prokka_dir)
+	return coords_dict, ice_dict, pos_dict, header, trnalist
 
 def get_args(argdict,vfdict,isdict,dfdict,metaldict,popdict,symdict,gene,feature,product):
 
@@ -461,36 +472,39 @@ def getfa(input,s,e):
 def charact_contig(contig_id: str, id_dict, fasta_file: Path, outdir: Path):
 
 	# Output paths and files
-	js_dir = outdir / 'js'
-	js_dir.mkdir(exist_ok=True)
-	gc_map = outdir / 'script' / 'js' / 'gcmap.js'
-	view_file = outdir / 'script' / 'js' / 'view.html'
-	ice_dir = outdir / f'{contig_id}_ICE'
-	shutil.rmtree(ice_dir,ignore_errors=True)
-	ice_dir.mkdir()
+	# ice_dir = outdir / f'{contig_id}_ICE'
+	# shutil.rmtree(ice_dir,ignore_errors=True)
+	# ice_dir.mkdir()
 
 	# Contig annotation
-	prokka_dir = prokka(contig_id, fasta_file)
-	ice_dict, info_dict = ICEscan(contig_id, prokka_dir, ice_dir)
-	dr_list = get_dr(contig_id, fasta_file, ice_dir)
+	prokka_dir = prokka(contig_id, fasta_file, outdir)
+	ice_dict, info_dict = ICEscan(contig_id, prokka_dir, outdir)
+	dr_df = get_dr(contig_id, fasta_file, outdir)
 
 	########################################
 	################# AQUI #################
 	########################################
-	dictICE, ice_dict, pos_dict, header, trnalist = ice_markers(contig_id, prokka_dir, ice_dict, dr_list)
+	# Calculate ICE limits
+	coords_dict, ann_dict, pos_dict, header, trnalist = ice_markers(contig_id, prokka_dir, ice_dict, dr_df)
+
+	# Detailed genes of interest search
 	outblast = outdir / 'blast'
 	outblast.mkdir(parents=True, exist_ok=True)
 	argdict = blastn_all(prokka_dir / f'{contig_id}.ffn', outdir / 'blast')
 	isdict, vfdict, metaldict, popdict, symdict = blastp_all(prokka_dir / f'{contig_id}.faa', outdir / 'blast')
-	dfdict = defense_finder(prokka_dir / f'{contig_id}.faa', outdir / 'defense_finder')
+	dfdict = defense_finder(contig_id, prokka_dir / f'{contig_id}.faa', outdir / 'defense_finder')
 
 	ICEss = {}
-	for key,value in dictICE.items():
+	for key,value in coords_dict.items():
 		genelist = []
 		regi = contig_id+'_'+key
 		regijs = 'contig_'+contig_id.split("_contig_", 1)[-1] +'_'+key
 		genefile = os.path.join(outdir,regi+'_gene.json')
 		infofile = os.path.join(outdir,regi+'_info.json')
+		js_dir = outdir / 'js'
+		js_dir.mkdir(exist_ok=True)
+		gc_map = outdir / 'script' / 'js' / 'gcmap.js'
+		view_file = outdir / 'script' / 'js' / 'view.html'
 		gcjson = os.path.join(js_dir,regijs+'_gc.js')
 		mapfile = os.path.join(js_dir,regijs+'.js')
 		htmlfile = os.path.join(outdir,regi+'.html')
@@ -523,8 +537,8 @@ def charact_contig(contig_id: str, id_dict, fasta_file: Path, outdir: Path):
 			s,e,strand,pro = pos_dict[gene]
 			pos = s+'..'+e+' ['+strand+'], '+str(int(e)-int(s)+1)
 
-			if gene in ice_dict[key]:
-				[feature,pro11] = ice_dict[key][gene].split('@')
+			if gene in ann_dict[key]:
+				[feature,pro11] = ann_dict[key][gene].split('@')
 			else:
 				feature,pro11 = '',''
 
@@ -703,43 +717,35 @@ def _meta(run_id: str, input: Path, outdir: Path, kraken_db: Union[Path, None], 
 
 	jsback = outdir / 'script' / 'js'
 
-	# En cuarentena, quizá recomendable borrar?
+	# En cuarentena, quizá borrar?
 	id_dict = rename(run_id,input)
 
 	# ICE markers annotations
-	chosen_contigs = prescan(run_id, input, outdir)
+	candidates = prescan(run_id, input, outdir)
 
 	# Taxonomy assignation (optional)
 	spdict = {}
 	report = None
 	if kraken_db:
 		spdict,report = kraken2(run_id, input, outdir, kraken_db)
-		copy_files(report, outdir)
+		# copy_files(report, outdir)
 
 	# Get basic information from input
 	basefile = seqkit(run_id, input, outdir)
-	copy_files(basefile, outdir)
-
-	#############################################################
-	##################### Por aquí me quedé #####################
-	#############################################################
+	# copy_files(basefile, outdir)
 	
 	i = 1 
 	ice_summary = []
 	for seq_record in SeqIO.parse(input, "fasta"):
-		if seq_record.id in chosen_contigs:
+		if seq_record.id in candidates:
 			logging.info(f"Analyzing contig {seq_record.id}")
 
 			# Extract contig of interest in fasta format
-			contig_folder = outdir / tmp_dir / f'{seq_record.id}'
-			contig_folder.mkdir(exist_ok=True)
-			contig_fasta = contig_folder / f'{seq_record.id}.fasta'
-			with contig_fasta.open("w") as oh:
-				SeqIO.write(seq_record, oh, "fasta")
+			contig_folder, contig_fasta = candidate_setup(seq_record, outdir)
 
 			# Characterize contig
 			ICEss = charact_contig(seq_record.id, id_dict, contig_fasta, contig_folder)
-			copy_files(contig_folder, outdir)
+			# copy_files(contig_folder, outdir)
 
 			if ICEss:
 				for key,value in ICEss.items():

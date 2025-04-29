@@ -6,7 +6,7 @@ import random,json
 import string,shutil
 import logging
 from pathlib import Path
-from typing import List, Union, Optional, Tuple
+from typing import List, Union, Optional, Tuple, Dict
 import subprocess
 import pandas as pd
 from Bio.Blast.Applications import NcbiblastpCommandline
@@ -31,7 +31,42 @@ logging.basicConfig(
 def get_time() -> str:
 	return time.asctime( time.localtime(time.time()) )
 
-def process_kraken2(output: Path) -> dict:
+def process_hmmscan(scan_file: Path):
+	df = pd.read_table(scan_file, sep=r"\s+", comment='#', header=None, usecols=range(5), 
+					   names=['target_name', 'accession', 'query_name', 'accession_fs', 'E-value_fs'])
+	df.drop_duplicates(subset='query_name', inplace=True)
+	df['key'] = df['query_name'].str.split('_').str[:-1].str.join('_')
+
+	chosen = []
+	for k, group in df.groupby('key'):
+		if scanf(group['target_name'].tolist()):
+			chosen.append(k)
+	return chosen
+
+def scanf(hmmlist: List) -> bool:
+
+	ice_count = []
+	for line in hmmlist:
+		if 'MOB' in line:
+			ice_count.append('MOB')
+		elif 't4cp' in line or 'tcpA' in line:
+			ice_count.append('t4cp')
+		elif 'FA' in line:
+			ice_count.append('T4SS')
+		elif line in [
+					 'Phage_integrase', 'UPF0236',
+					 'Recombinase', 'rve', 'TIGR02224',
+					 'TIGR02249', 'TIGR02225', 'PB001819'
+					 ]:
+			ice_count.append('Int')
+		else:
+			ice_count.append('T4SS')
+	if ice_count.count('MOB') and ice_count.count('t4cp') and ice_count.count('Int') and ice_count.count('T4SS') >= 5:
+		return True
+	else:
+		return False
+
+def process_kraken2(output: Path) -> Dict:
 	spdict = {}
 	with output.open() as fh:
 		for line in fh:
@@ -73,7 +108,7 @@ def get_ranks(taxid: int, _ncbi_db) -> Tuple[str, str]:
 
     return sp_name, st_name
 
-def process_seqkit(result: Path, run_id: str) -> dict:
+def process_seqkit(result: Path, run_id: str) -> Dict:
 	for raw in result.stdout.splitlines():
 		line = raw.strip()
 		if not line.startswith("#") and not line.lower().startswith("file"):
@@ -91,7 +126,7 @@ def process_seqkit(result: Path, run_id: str) -> dict:
 	
 	return base_dict
 
-def parse_icescan(ice_res: Path) -> Tuple[dict, dict]:
+def parse_icescan(ice_res: Path) -> Tuple[Dict, Dict]:
 	df_systems = pd.read_table(ice_res, comment='#')
 	df_systems = df_systems[df_systems.model_fqn.str.contains('Chromosome')]
 	df_systems = df_systems[~df_systems.model_fqn.str.contains('UserReplicon_IME')]
@@ -133,18 +168,34 @@ def get_feat(feat):
 	else:
 		return 'T4SS@'+feat.replace('T4SS_','')
 
-def process_vmatch(result) -> List:
-	dr_list = []
-	for raw in result.stdout.splitlines():
-		line = raw.strip()
-		if not line.startswith("#"):
-			cols = line.split()
-			dr = [f'{cols[2]}|{int(cols[2])+int(cols[0])}|{cols[6]}|{int(cols[6])+int(cols[4])}']
-			dr_list.append(dr)
-	return dr_list
+def process_vmatch(result) -> pd.DataFrame:
+    rows = []
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if not line.startswith("#"):
+            cols = line.split()
+            start1 = int(cols[2])
+            end1 = start1 + int(cols[0])
+            start2 = int(cols[6])
+            end2 = start2 + int(cols[4])
+            rows.append([start1, end1, start2, end2])
+    
+    df = pd.DataFrame(rows, columns=["start1", "end1", "start2", "end2"])
+    return df
+
+def parse_defensefinder(infile: Path) -> Dict:
+    results: Dict[str, str] = {}
+    with infile.open() as fh:
+        for line in fh:
+            if line.startswith('replicon'):
+                continue
+            fields = line.rstrip("\n").split('\t')
+            locus, gene = fields[1], fields[2]
+            results[locus] = gene.replace('__', ',')
+    return results
 
 # Commands
-def kraken2(run_id: str, infile: Path, outdir: Path, db: Path) -> Tuple[dict, Path]:
+def kraken2(run_id: str, infile: Path, outdir: Path, db: Path) -> Tuple[Dict, Path]:
 	logging.info("Running Kraken2")
 
 	report = outdir / 'tmp' / f'{run_id}_kraken.report'
@@ -228,9 +279,9 @@ def hmmscan(run_id: str, infile: Path, outdir: Path, anno_fa: Path) -> Path:
 
 	return scan_file
 
-def prokka(run_id: str, infile: Path) -> Path:
+def prokka(run_id: str, infile: Path, outdir: Path) -> Path:
 	logging.info(f"Running Prokka on contig {run_id}")
-	outdir = infile.parent / 'prokka'
+	outdir = outdir / 'prokka'
 	cmd = [
 		'prokka',
 		infile,
@@ -250,10 +301,10 @@ def prokka(run_id: str, infile: Path) -> Path:
 
 	return outdir
 
-def ICEscan(contig_id, prokka_dir, ice_dir) -> Tuple[dict, dict]:
+def ICEscan(contig_id: str, prokka_dir: Path, outdir: Path) -> Tuple[Dict, Dict]:
 	logging.info(f"Running Macsyfinder with ICEscan model on contig {contig_id}")
 	anno_fa = prokka_dir / f'{contig_id}.faa'
-
+	outdir = outdir / 'mcsy_icescan'
 	cmd = [
 		'macsyfinder',
 		'--db-type', 'ordered_replicon',
@@ -262,12 +313,13 @@ def ICEscan(contig_id, prokka_dir, ice_dir) -> Tuple[dict, dict]:
 		'--replicon-topology', 'linear',
 		'--coverage-profile', '0.3',
 		'--sequence-db', anno_fa,
-		'-o', ice_dir
+		'--force',
+		'-o', outdir
 	]
 
 	try:
 		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
-		ice_dict, info_dict = parse_icescan(ice_dir / 'all_systems.tsv')
+		ice_dict, info_dict = parse_icescan(outdir / 'all_systems.tsv')
 	except subprocess.CalledProcessError as e:
 		logging.error(f"Macsyfinder execution failed: {e}")
 
@@ -308,14 +360,14 @@ def get_dr(run_id: str, infile: Path, output: Path):
 	return dr_list
 
 def blastp(faa_file, db, outfile):
-	logging.info(f"Running Blastp for {db} detection")
+	logging.info(f"Running Blastp for {db.stem} detection")
 	blastp_cline = NcbiblastpCommandline(cmd='blastp', query=faa_file, db=db, \
                        evalue=0.0001, num_threads=20, max_hsps=1, max_target_seqs=1, \
                        outfmt="6 std slen stitle", out=outfile)
 	blastp_cline()
 
 def blastn(fna_file, db, outfile):
-	logging.info(f"Running Blastn for {db} detection")
+	logging.info(f"Running Blastn for {db.stem} detection")
 	blastp_cline = NcbiblastnCommandline(cmd='blastn', query=fna_file, db=db, \
                        evalue=0.0001, num_threads=20, max_hsps=1, max_target_seqs=1, \
                        outfmt="6 std slen stitle", out=outfile)
@@ -348,23 +400,22 @@ def blastn_all(infile, outdir):
 
 	return results_dict
 
-def defense_finder(infile, outdir):
+def defense_finder(run_id: str, infile: Path, outdir: Path) -> Dict:
+	logging.info("Running Defense_finder")
+	outdir = outdir / 'defense_finder'
+	cmd = [
+		'defense-finder', 'run',
+		'-w', str(8),
+		'--models-dir', Path(__file__).parents[1] / 'data' / 'macsydata',
+		'-o', outdir,
+		infile
+		]
+	
+	try:
+		subprocess.run(cmd, check=True, stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL)
+		df_dict = parse_defensefinder(outdir / f'{run_id}_defense_finder_genes.tsv')
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Macsyfinder execution failed: {e}")
 
-	if not os.path.exists(os.path.join(tmp_dir,runID,runID+'.locus_tag.faa')):
-		infaa = os.path.join(gb_dir,runID+'.faa')
-	else:
-		infaa = os.path.join(tmp_dir,runID,runID+'.locus_tag.faa')
+	return df_dict
 
-	dfout = os.path.join(tmp_dir,runID,'defense_'+runID)
-	defcmd = [defensefinder, 'run', '-w 8 --models-dir ./data/macsydata/','-o', outdir, infile, '> /dev/null']
-	print(' '.join(defcmd))
-	os.system(' '.join(defcmd))
-
-	dfdict = {}
-	with open(os.path.join(dfout,f'{runID}_defense_finder_genes.tsv')) as dfres:
-		for line in dfres.readlines():
-			lines = line.strip().split('\t')
-			if lines[0] != 'replicon':
-				dfdict[lines[1]] = lines[2].replace('__',',')
-
-	return dfdict
