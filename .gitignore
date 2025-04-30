@@ -1,5 +1,6 @@
 data/
 tmp/
 result/
-script/\_\_pycache\_\_/
+__pycache__/
 example/
+*.py[cod]
